@@ -1,0 +1,88 @@
+#!/bin/bash
+set -uo pipefail
+
+# uninstall.sh - remove the auto-hotspot LaunchAgent for the current user.
+# Never run this as root: it only touches per-user paths under $HOME.
+
+if [ "$(id -u)" -eq 0 ]; then
+  echo "error: do not run uninstall.sh as root. This manages a user LaunchAgent and must run as the logged-in user." >&2
+  exit 1
+fi
+
+ROOT="$(cd "$(dirname "$0")" && pwd -P)"
+
+LABEL="com.andrewwang.autohotspot"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+CONFIG="$HOME/.config/auto-hotspot/config"
+LOG="$HOME/Library/Logs/auto-hotspot.log"
+STATE_DIR="$HOME/.local/state/auto-hotspot"
+DOMAIN="gui/$(id -u)"
+
+PURGE=0
+
+usage() {
+  cat <<EOF
+Usage: uninstall.sh [options]
+
+Removes the auto-hotspot LaunchAgent for the current user (must not run as root).
+
+Options:
+  --purge      Also delete config, state dir, and logs
+  -h, --help   Show this help
+
+Without --purge, config and logs are kept in place.
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --purge)
+      PURGE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+echo "==> Unloading LaunchAgent"
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  echo "unloaded $LABEL"
+elif [ "$rc" -eq 3 ]; then
+  echo "$LABEL was already not loaded"
+else
+  echo "launchctl bootout exited with status $rc (continuing)"
+fi
+
+echo "==> Clearing any disabled override"
+launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
+
+echo "==> Removing LaunchAgent plist"
+rm -f "$PLIST"
+
+if [ "$PURGE" -eq 1 ]; then
+  echo "==> Purging config, state, and logs"
+  rm -rf "$HOME/.config/auto-hotspot" "$STATE_DIR"
+  rm -f "$LOG" "$LOG.1" \
+    "$HOME/Library/Logs/auto-hotspot.launchd.out" \
+    "$HOME/Library/Logs/auto-hotspot.launchd.err"
+else
+  echo "==> Kept config ($CONFIG) and logs ($LOG*)"
+fi
+
+echo "==> Verifying"
+if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  echo "warning: $LABEL still appears loaded" >&2
+  exit 1
+else
+  echo "confirmed: $LABEL is not loaded"
+fi

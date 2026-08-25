@@ -1,0 +1,312 @@
+#!/bin/bash
+# hotspotd - CLI for auto-hotspot (join iPhone hotspot when Wi-Fi has no internet)
+set -uo pipefail
+
+LABEL="com.andrewwang.autohotspot"
+PLIST="$HOME/Library/LaunchAgents/com.andrewwang.autohotspot.plist"
+CONFIG="${AUTO_HOTSPOT_CONFIG:-$HOME/.config/auto-hotspot/config}"
+LOG="${AUTO_HOTSPOT_LOG:-$HOME/Library/Logs/auto-hotspot.log}"
+STATE_DIR="${AUTO_HOTSPOT_STATE:-$HOME/.local/state/auto-hotspot}"
+
+SELF="$0"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+BIN_DIR="$(cd "$(dirname "$SELF")" && pwd -P)"
+ROOT="$(cd "$BIN_DIR/.." && pwd -P)"
+CHECKER="$ROOT/libexec/auto-hotspot-check.sh"
+
+err() { echo "hotspotd: $*" >&2; }
+
+load_config() {
+  SSID=$(printf 'Andrew\342\200\231s iPhone')
+  CHECK_INTERVAL=120
+  ENABLED=1
+  COOLDOWN=300
+  WIFI_INTERFACE=en0
+  HOTSPOTD_BIN=""
+  if [ -f "$CONFIG" ]; then
+    . "$CONFIG"
+  fi
+}
+
+config_set() {
+  key="$1"
+  value="$2"
+  mkdir -p "$(dirname "$CONFIG")"
+  tmp="$CONFIG.tmp.$$"
+  : > "$tmp"
+  if [ -f "$CONFIG" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "$key="*) ;;
+        *) printf '%s\n' "$line" >> "$tmp" ;;
+      esac
+    done < "$CONFIG"
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  mv -f "$tmp" "$CONFIG"
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+current_ssid() {
+  ssid="$(networksetup -getairportnetwork "$WIFI_INTERFACE" 2>/dev/null | sed -n 's/^Current Wi-Fi Network: //p')"
+  if [ -z "$ssid" ]; then
+    ssid="$(ipconfig getsummary "$WIFI_INTERFACE" 2>/dev/null | sed -n 's/.*SSID : \(.*\)/\1/p' | head -1)"
+  fi
+  printf '%s' "$ssid"
+}
+
+wifi_power() {
+  networksetup -getairportpower "$WIFI_INTERFACE" 2>/dev/null | sed -n 's/^Wi-Fi Power ([^)]*): //p'
+}
+
+is_online() {
+  body="$(/usr/bin/curl -sS -m 4 http://captive.apple.com/hotspot-detect.html 2>/dev/null)"
+  case "$body" in
+    *"<TITLE>Success</TITLE>"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+agent_loaded() {
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+}
+
+cmd_on() {
+  load_config
+  config_set ENABLED 1
+  launchctl enable "gui/$(id -u)/$LABEL" 2>/dev/null
+  if agent_loaded; then
+    launchctl kickstart "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+  fi
+  echo "auto-hotspot: enabled"
+}
+
+cmd_off() {
+  load_config
+  config_set ENABLED 0
+  launchctl disable "gui/$(id -u)/$LABEL" 2>/dev/null
+  echo "auto-hotspot: disabled"
+}
+
+cmd_status() {
+  load_config
+  json_mode=0
+  if [ "${1:-}" = "--json" ]; then
+    json_mode=1
+  fi
+
+  ssid_current="$(current_ssid)"
+  power="$(wifi_power)"
+  if is_online; then online=1; else online=0; fi
+  if [ -f "$PLIST" ]; then installed=1; else installed=0; fi
+  if agent_loaded; then loaded=1; else loaded=0; fi
+
+  if [ "$json_mode" -eq 1 ]; then
+    e_ssid="$(json_escape "$SSID")"
+    e_ssid_current="$(json_escape "$ssid_current")"
+    e_iface="$(json_escape "$WIFI_INTERFACE")"
+    e_power="$(json_escape "$power")"
+    e_log="$(json_escape "$LOG")"
+    if [ "$ENABLED" = "1" ]; then enabled_b=true; else enabled_b=false; fi
+    if [ "$loaded" -eq 1 ]; then loaded_b=true; else loaded_b=false; fi
+    if [ "$online" -eq 1 ]; then online_b=true; else online_b=false; fi
+    printf '{"enabled":%s,"agent_loaded":%s,"online":%s,"ssid":"%s","ssid_current":"%s","interface":"%s","wifi_power":"%s","check_interval":%s,"cooldown":%s,"log_path":"%s"}\n' \
+      "$enabled_b" "$loaded_b" "$online_b" "$e_ssid" "$e_ssid_current" "$e_iface" "$e_power" "$CHECK_INTERVAL" "$COOLDOWN" "$e_log"
+    return 0
+  fi
+
+  now="$(date +%s)"
+  stamp_file="$STATE_DIR/last-join-attempt"
+  cooldown_remaining=0
+  if [ -f "$stamp_file" ]; then
+    last="$(cat "$stamp_file" 2>/dev/null)"
+    case "$last" in
+      ''|*[!0-9]*) last=0 ;;
+    esac
+    elapsed=$((now - last))
+    remaining=$((COOLDOWN - elapsed))
+    if [ "$remaining" -gt 0 ]; then
+      cooldown_remaining="$remaining"
+    fi
+  fi
+
+  echo "auto-hotspot status"
+  echo "  config:            $CONFIG"
+  echo "  target SSID:       $SSID"
+  echo "  enabled:           $ENABLED"
+  echo "  check interval:    ${CHECK_INTERVAL}s"
+  echo "  cooldown:          ${COOLDOWN}s"
+  echo "  interface:         $WIFI_INTERFACE"
+  echo "  wifi power:        $power"
+  if [ -n "$ssid_current" ]; then
+    echo "  current SSID:      $ssid_current"
+  else
+    echo "  current SSID:      (not associated)"
+  fi
+  if [ "$online" -eq 1 ]; then
+    echo "  online:            yes"
+  else
+    echo "  online:            no"
+  fi
+  if [ "$installed" -eq 1 ]; then
+    if [ "$loaded" -eq 1 ]; then
+      echo "  agent:             installed, loaded"
+    else
+      echo "  agent:             installed, not loaded"
+    fi
+  else
+    echo "  agent:             not installed"
+  fi
+  echo "  cooldown remaining: ${cooldown_remaining}s"
+  echo "  log:               $LOG"
+  if [ -f "$LOG" ]; then
+    echo "  last 5 log lines:"
+    tail -n 5 "$LOG" | sed 's/^/    /'
+  fi
+}
+
+cmd_check() {
+  load_config
+  if [ ! -f "$CHECKER" ]; then
+    err "checker not found at $CHECKER"
+    return 1
+  fi
+  AUTO_HOTSPOT_FORCE=1 "$CHECKER"
+  rc=$?
+  if [ -f "$LOG" ]; then
+    tail -n 10 "$LOG"
+  fi
+  return $rc
+}
+
+cmd_logs() {
+  load_config
+  case "${1:-}" in
+    -f)
+      if [ ! -f "$LOG" ]; then
+        echo "no log yet at $LOG"
+        return 0
+      fi
+      tail -f "$LOG"
+      ;;
+    --open)
+      if [ ! -f "$LOG" ]; then
+        echo "no log yet at $LOG"
+        return 0
+      fi
+      /usr/bin/open -a Console "$LOG"
+      ;;
+    *)
+      n="${1:-50}"
+      if [ ! -f "$LOG" ]; then
+        echo "no log yet at $LOG"
+        return 0
+      fi
+      tail -n "$n" "$LOG"
+      ;;
+  esac
+}
+
+cmd_install() {
+  if [ ! -f "$ROOT/install.sh" ]; then
+    err "install.sh not found at $ROOT/install.sh"
+    exit 1
+  fi
+  exec "$ROOT/install.sh" "$@"
+}
+
+cmd_uninstall() {
+  if [ ! -f "$ROOT/uninstall.sh" ]; then
+    err "uninstall.sh not found at $ROOT/uninstall.sh"
+    exit 1
+  fi
+  exec "$ROOT/uninstall.sh" "$@"
+}
+
+cmd_menubar() {
+  load_config
+  build_only=0
+  for a in "$@"; do
+    if [ "$a" = "--build-only" ]; then
+      build_only=1
+    fi
+  done
+
+  mkdir -p "$ROOT/build"
+  swiftc -O -o "$ROOT/build/AutoHotspot" "$ROOT/menubar/AutoHotspot.swift"
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    err "swiftc build failed"
+    return 1
+  fi
+
+  mkdir -p "$ROOT/build/AutoHotspot.app/Contents/MacOS"
+  cp "$ROOT/build/AutoHotspot" "$ROOT/build/AutoHotspot.app/Contents/MacOS/AutoHotspot"
+  cp "$ROOT/menubar/Info.plist" "$ROOT/build/AutoHotspot.app/Contents/Info.plist"
+
+  codesign --force --deep --sign - "$ROOT/build/AutoHotspot.app"
+  xattr -dr com.apple.quarantine "$ROOT/build/AutoHotspot.app" 2>/dev/null || true
+
+  pkill -f 'AutoHotspot.app/Contents/MacOS/AutoHotspot' 2>/dev/null || true
+
+  config_set HOTSPOTD_BIN "$BIN_DIR/hotspotd"
+
+  if [ "$build_only" -eq 0 ]; then
+    open "$ROOT/build/AutoHotspot.app"
+  fi
+}
+
+cmd_help() {
+  load_config
+  cat <<EOF
+usage: hotspotd <subcommand> [args]
+
+subcommands:
+  on              enable auto-hotspot (flips config; does not require install)
+  off             disable auto-hotspot (flips config; does not require install)
+  status          show current status (add --json for machine-readable output)
+  check           run one check/join cycle immediately, ignoring cooldown
+  logs            show recent log lines (logs [N] | logs -f | logs --open)
+  install         install the launchd agent (delegates to install.sh)
+  uninstall       remove the launchd agent (delegates to uninstall.sh)
+  menubar         build, sign, and launch the menu bar app
+  help            show this help
+  version         print the version
+
+config: $CONFIG
+log:    $LOG
+EOF
+}
+
+cmd_version() {
+  echo "hotspotd 1.0.0"
+}
+
+main() {
+  sub="${1:-help}"
+  if [ $# -gt 0 ]; then
+    shift
+  fi
+  case "$sub" in
+    on) cmd_on "$@" ;;
+    off) cmd_off "$@" ;;
+    status) cmd_status "$@" ;;
+    check) cmd_check "$@" ;;
+    logs) cmd_logs "$@" ;;
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    menubar) cmd_menubar "$@" ;;
+    help|-h|--help|-\?) cmd_help "$@" ;;
+    version) cmd_version "$@" ;;
+    *)
+      err "unknown subcommand: $sub"
+      cmd_help >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

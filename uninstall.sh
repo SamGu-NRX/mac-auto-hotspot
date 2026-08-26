@@ -69,6 +69,24 @@ launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
 echo "==> Removing LaunchAgent plist"
 rm -f "$PLIST"
 
+echo "==> Removing hotspotd PATH symlink"
+removed_link=0
+for d in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
+  link="$d/hotspotd"
+  # only remove a symlink that points back into this checkout; never a real file
+  if [ -L "$link" ]; then
+    target="$(readlink "$link" 2>/dev/null || true)"
+    if [ "$target" = "$ROOT/bin/hotspotd" ]; then
+      rm -f "$link" && echo "removed $link" && removed_link=1
+    else
+      echo "skipped $link (points elsewhere: $target)"
+    fi
+  fi
+done
+if [ "$removed_link" -eq 0 ]; then
+  echo "no symlink to remove"
+fi
+
 if [ "$PURGE" -eq 1 ]; then
   echo "==> Purging config, state, and logs"
   rm -rf "$HOME/.config/auto-hotspot" "$STATE_DIR"

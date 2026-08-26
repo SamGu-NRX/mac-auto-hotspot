@@ -212,13 +212,44 @@ else
   fi
 fi
 
+echo "==> Linking hotspotd onto PATH"
+LINK_DIR=""
+for d in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
+  case ":$PATH:" in
+    *":$d:"*)
+      if [ -d "$d" ] && [ -w "$d" ]; then
+        LINK_DIR="$d"
+        break
+      fi
+      ;;
+  esac
+done
+
+if [ -z "$LINK_DIR" ]; then
+  if mkdir -p "$HOME/.local/bin" 2>/dev/null && [ -w "$HOME/.local/bin" ]; then
+    LINK_DIR="$HOME/.local/bin"
+    echo "note: $LINK_DIR is not on your PATH yet. Add this to your shell profile:"
+    echo "      export PATH=\"\$HOME/.local/bin:\$PATH\""
+  fi
+fi
+
+if [ -n "$LINK_DIR" ]; then
+  if ln -sfn "$ROOT/bin/hotspotd" "$LINK_DIR/hotspotd" 2>/dev/null; then
+    echo "linked $LINK_DIR/hotspotd -> $ROOT/bin/hotspotd"
+  else
+    echo "warning: could not link into $LINK_DIR; call $ROOT/bin/hotspotd directly" >&2
+  fi
+else
+  echo "warning: no writable PATH directory found; call $ROOT/bin/hotspotd directly" >&2
+fi
+
 echo "==> Done"
 cat <<EOF
-Next steps:
-  bin/hotspotd status   check current state
-  bin/hotspotd logs     tail the log
-  bin/hotspotd off      pause auto-hotspot
-  bin/hotspotd menubar  launch the menu bar toggle app
+Next steps (open a new shell first, or run: hash -r)
+  hotspotd status   check current state
+  hotspotd logs     tail the log
+  hotspotd off      pause auto-hotspot
+  hotspotd menubar  build + launch the menu bar toggle app
 
 Note: RunAtLoad means a reachability check just ran.
 EOF

@@ -110,11 +110,13 @@ cmd_status() {
     e_iface="$(json_escape "$WIFI_INTERFACE")"
     e_power="$(json_escape "$power")"
     e_log="$(json_escape "$LOG")"
+    e_config="$(json_escape "$CONFIG")"
     if [ "$ENABLED" = "1" ]; then enabled_b=true; else enabled_b=false; fi
     if [ "$loaded" -eq 1 ]; then loaded_b=true; else loaded_b=false; fi
     if [ "$online" -eq 1 ]; then online_b=true; else online_b=false; fi
-    printf '{"enabled":%s,"agent_loaded":%s,"online":%s,"ssid":"%s","ssid_current":"%s","interface":"%s","wifi_power":"%s","check_interval":%s,"cooldown":%s,"log_path":"%s"}\n' \
-      "$enabled_b" "$loaded_b" "$online_b" "$e_ssid" "$e_ssid_current" "$e_iface" "$e_power" "$CHECK_INTERVAL" "$COOLDOWN" "$e_log"
+    if [ "$installed" -eq 1 ]; then installed_b=true; else installed_b=false; fi
+    printf '{"enabled":%s,"agent_installed":%s,"agent_loaded":%s,"online":%s,"ssid":"%s","ssid_current":"%s","interface":"%s","wifi_power":"%s","check_interval":%s,"cooldown":%s,"log_path":"%s","config_path":"%s"}\n' \
+      "$enabled_b" "$installed_b" "$loaded_b" "$online_b" "$e_ssid" "$e_ssid_current" "$e_iface" "$e_power" "$CHECK_INTERVAL" "$COOLDOWN" "$e_log" "$e_config"
     return 0
   fi
 

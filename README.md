@@ -35,7 +35,15 @@ Flags:
 
 ## Usage
 
-`bin/hotspotd` is the only command you need day to day.
+`hotspotd` is the only command you need day to day. `install.sh` symlinks it into the first
+writable directory on your `PATH` (`~/.local/bin`, `/opt/homebrew/bin`, or `/usr/local/bin`), so
+after installing you can call it from anywhere. Open a new shell or run `hash -r` first — zsh
+caches command lookups. If no writable `PATH` directory exists, the installer says so and you call
+`bin/hotspotd` by path instead.
+
+Because it is a symlink rather than a copy, `git pull` updates the command in place. `hotspotd`
+resolves its own real path to find `libexec/` and `menubar/`, so moving the checkout breaks the
+link — re-run `./install.sh` after moving it.
 
 | Subcommand | What it does |
 |---|---|
@@ -47,6 +55,10 @@ Flags:
 | `install` | Runs the installer (same as `./install.sh`). |
 | `uninstall` | Runs the uninstaller (same as `./uninstall.sh`). |
 | `menubar` | Builds and launches the menu bar toggle app. |
+
+`status --json` reports `enabled`, `agent_installed`, `agent_loaded`, `online`, `ssid`,
+`ssid_current`, `interface`, `wifi_power`, `check_interval`, `cooldown`, `log_path`, and
+`config_path`. The menu bar app renders all of them.
 
 `on` and `off` both flip the config flag and call `launchctl enable`/`disable`. Pausing or resuming the agent never requires a reinstall.
 
@@ -92,7 +104,17 @@ A cooldown timestamp at `~/.local/state/auto-hotspot/last-join-attempt` limits f
 codesign --force --deep --sign - build/AutoHotspot.app
 ```
 
-strips the quarantine attribute, and launches it. The app has no logic of its own — it shells out to `hotspotd` for every action. To have it start at login, add it to Login Items yourself; the installer doesn't do this for you.
+strips the quarantine attribute, and launches it. The app has no logic of its own — it shells out
+to `hotspotd` for every action.
+
+The menu bar icon is the `personalhotspot` SF Symbol, dimmed and slashed when auto-join is paused.
+The menu shows a headline status line (green online / red offline / orange Wi-Fi off), the target
+hotspot, and a **Settings** submenu listing the interface, check interval, retry cooldown, agent
+state, log path, and config path, plus **Edit Config…** and **Reveal Log in Finder**.
+
+To have it start at login, add `build/AutoHotspot.app` to Login Items yourself; the installer
+doesn't do this for you. Note that `build/` is gitignored, so a fresh clone must run
+`hotspotd menubar` once to build the app.
 
 ## Uninstall
 

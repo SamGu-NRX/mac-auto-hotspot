@@ -61,3 +61,23 @@ Env overrides for testing without touching the real install: `AUTO_HOTSPOT_CONFI
 ## Commits
 
 Conventional Commits (`feat`, `fix`, `docs`, `chore`, …), imperative mood, lowercase subject, no AI attribution trailers.
+
+## Menu bar app conventions
+
+- `NSMenu.autoenablesItems` must stay `false` on both the root menu and the Settings submenu.
+  AppKit's auto-validation overrides any manual `isEnabled`, which silently breaks caption rows
+  and the busy state during `Check Now`.
+- Caption and settings rows are rendered with an explicit `attributedTitle` (secondary colour,
+  small system font) rather than relying on the disabled-item appearance, which renders washed out.
+- The status item icon uses `personalhotspot` / `personalhotspot.slash`. Do not go back to
+  `wifi` / `wifi.slash` — that pair reads as "your Wi-Fi is broken" rather than "auto-join is off".
+- Entry point is `app.run()`, not `NSApplicationMain`, since there is no nib and the delegate is
+  assigned by hand.
+- Every field in `hotspotd status --json` should be displayed somewhere in the menu. Adding a key
+  to the CLI's JSON means adding a row here too.
+
+## PATH symlink
+
+`install.sh` links `bin/hotspotd` into the first writable directory on `PATH`. `uninstall.sh`
+removes it only when `readlink` confirms it points back into this checkout — never delete a
+`hotspotd` on `PATH` without that check.

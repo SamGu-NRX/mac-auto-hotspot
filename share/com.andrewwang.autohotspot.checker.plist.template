@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Backstop LaunchAgent. The AutoHotspot.app watcher (the other plist in this
+  directory) owns joining while it's alive, but it's one long-running
+  process kept alive by KeepAlive; if it's down or crash-looping (a
+  Location/TCC fault, a startup exception, anything) nothing else drives
+  reconnection without this. This job runs libexec/auto-hotspot-check.sh on
+  a fixed interval as a fallback — the script already checks for the app's
+  process and exits immediately if it's running (see the "defer to the
+  agent" guard near the top of auto-hotspot-check.sh), so this never fights
+  the primary watcher over Wi-Fi state; it only acts when the watcher can't.
+
+  Placeholders substituted by install.sh:
+    __CHECKER_LABEL__          launchd job label for this backstop job
+    __CHECKER_PATH__           absolute path to libexec/auto-hotspot-check.sh
+    __CHECK_INTERVAL__         seconds between runs (same value the app's
+                                own safety-net timer uses)
+    __CHECKER_LOG_PATH__       stdout log (launchd-level)
+    __CHECKER_ERR_LOG_PATH__   stderr log (launchd-level)
+
+  StartInterval is used here — not KeepAlive — because this job is meant to
+  run once per interval and exit, not stay resident; KeepAlive and
+  StartInterval cannot coexist in one plist, which is exactly why this is a
+  second job rather than a second key in the watcher's plist.
+
+  Rendered output belongs at
+  ~/Library/LaunchAgents/com.andrewwang.autohotspot.checker.plist,
+  mode 0644, owned by the user — never root.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>__CHECKER_LABEL__</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__CHECKER_PATH__</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>__CHECK_INTERVAL__</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>__CHECKER_LOG_PATH__</string>
+	<key>StandardErrorPath</key>
+	<string>__CHECKER_ERR_LOG_PATH__</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+</dict>
+</plist>

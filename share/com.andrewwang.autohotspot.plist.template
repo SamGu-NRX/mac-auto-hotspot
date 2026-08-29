@@ -2,11 +2,26 @@
 <!--
   Placeholders substituted by install.sh (sed, `|` delimiter — paths may contain
   spaces and slashes):
-    __LABEL__          launchd job label (also determines the installed filename)
-    __CHECKER_PATH__   absolute path to libexec/auto-hotspot-check.sh
-    __CHECK_INTERVAL__ seconds between checks
-    __LOG_PATH__       stdout log (launchd-level, not the app log)
-    __ERR_LOG_PATH__   stderr log (launchd-level, not the app log)
+    __LABEL__            launchd job label (also determines the installed filename)
+    __APP_BUNDLE_PATH__  absolute path to AutoHotspot.app (the bundle, not the Mach-O inside it)
+    __LOG_PATH__         stdout log (launchd-level, not the app log)
+    __ERR_LOG_PATH__     stderr log (launchd-level, not the app log)
+
+  The agent is long-running and kept alive rather than timer-invoked; it does
+  its own safety-net polling at CHECK_INTERVAL, read from the config at runtime.
+
+  ProgramArguments launches the app bundle via `/usr/bin/open -g -W` rather
+  than exec'ing the Mach-O directly: launchd invoking a GUI LSUIElement
+  binary with no LaunchServices involvement is an unreliable way to get the
+  CoreLocation authorization sheet to surface (it can leave
+  authorizationStatus stuck at .notDetermined forever). `open -g` is the
+  same launch path bin/hotspotd's own `menubar` subcommand uses and that
+  was verified to prompt for Location; `-g` keeps it from stealing focus
+  (appropriate for an LSUIElement agent) and `-W` makes `open` block until
+  the app quits, so launchd sees one long-lived job under KeepAlive instead
+  of `open` exiting immediately and triggering a respawn loop. TCC identity
+  (and the Location grant) is keyed to the app bundle's own code signature,
+  not to `open`, so this doesn't change what's being authorized.
 
   Rendered output belongs at ~/Library/LaunchAgents/com.andrewwang.autohotspot.plist,
   mode 0644, owned by the user — never root.
@@ -18,10 +33,13 @@
 	<string>__LABEL__</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>__CHECKER_PATH__</string>
+		<string>/usr/bin/open</string>
+		<string>-g</string>
+		<string>-W</string>
+		<string>__APP_BUNDLE_PATH__</string>
 	</array>
-	<key>StartInterval</key>
-	<integer>__CHECK_INTERVAL__</integer>
+	<key>KeepAlive</key>
+	<true/>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardOutPath</key>

@@ -1,13 +1,29 @@
 # mac-auto-hotspot
 
-A launchd LaunchAgent that polls internet reachability and, when the Mac is offline, joins your saved iPhone hotspot. Comes with a CLI (`bin/hotspotd`) and an optional menu bar toggle. No sudo, no Homebrew, no Xcode.
+A signed menu bar app that watches your network state and, when the Mac goes offline, joins your
+iPhone's Personal Hotspot. Comes with a CLI (`bin/hotspotd`) as the day-to-day front end. No sudo,
+no Homebrew, no third-party dependencies.
+
+## One thing you must do on the iPhone
+
+**With the Personal Hotspot toggle OFF, no Mac software can wake it — not this tool, not any
+other — without Accessibility access to the Wi-Fi menu, which this project deliberately does not
+use.** A toggle-off hotspot only becomes joinable through Instant Hotspot, which is an iOS
+Bluetooth/Wi-Fi handshake the phone initiates, not something a Mac can trigger from software.
+
+So: on the iPhone, go to Settings → Personal Hotspot and leave **Allow Others to Join** enabled.
+With that on, the phone advertises the hotspot over Bluetooth LE and starts broadcasting Wi-Fi the
+moment a known Mac looks for it — which is what makes this tool's join attempts actually land.
+Leave the toggle itself off; you don't need to switch it on by hand.
 
 ## Requirements
 
 - macOS 26 (Tahoe) on Apple Silicon.
-- The Swift toolchain, only if you build the menu bar app. `swiftc` ships with the Command Line Tools, not the full Xcode install.
+- The Swift toolchain to build the app once. `swiftc` ships with the Command Line Tools, not the
+  full Xcode install.
 - A Wi-Fi interface named `en0`.
-- The hotspot already saved as a preferred network, so its password is in the system keychain. Verify with:
+- The hotspot already saved as a preferred network, so its password is in the system keychain.
+  Verify with:
 
 ```
 networksetup -listpreferredwirelessnetworks en0
@@ -26,12 +42,35 @@ cd mac-auto-hotspot
 Flags:
 
 - `--ssid <name>` — hotspot SSID to join (default `Andrew’s iPhone`).
-- `--interval <seconds>` — how often to check reachability (default 120).
-- `--cooldown <seconds>` — minimum gap between join attempts (default 300).
+- `--interval <seconds>` — safety-net poll interval, in case the event-driven watcher misses a
+  transition (default 300).
+- `--cooldown <seconds>` — minimum gap between join attempts after a failure (default 30).
+- `--router <ip>` — the iPhone's tethering gateway IP, used to verify a join actually succeeded
+  (default `172.20.10.1`).
 - `--no-load` — write config and the plist but don't bootstrap the agent.
 - `--dry-run` — print what would happen, change nothing.
 
-`install.sh` sets `RunAtLoad` in the plist, so the first reachability check runs immediately once the agent loads, not after the first interval.
+`install.sh` builds and ad-hoc signs `AutoHotspot.app`, installs it at the fixed path
+`~/Applications/AutoHotspot.app` (outside the repo checkout, so moving or deleting the checkout
+later doesn't break it), and writes a plist with `KeepAlive` + `RunAtLoad` and no periodic-timer key.
+The app is a long-running process, not a periodic job.
+
+## One-time Location Services prompt
+
+The app asks for **When In Use** location access the first time it launches. This isn't optional
+window dressing: on macOS 26, reading a real Wi-Fi SSID — even the one you're already associated
+to — is gated behind that permission for every process, with no exception for background agents.
+Without it, the app can still detect "online vs. offline" (that needs no permission) but can't scan
+for or report the actual network name.
+
+Approve the prompt once and it sticks, as long as the app's code signature doesn't change.
+That's the catch: **an ad-hoc-signed rebuild rotates the signature's ad-hoc cdhash, and macOS treats
+that as a new app — it silently revokes the Location grant and you'll be prompted again.**
+`hotspotd menubar` (no flags) never rebuilds for exactly this reason; only `hotspotd menubar
+--rebuild` does. If you rebuild often, create a self-signed codesigning identity named
+`AutoHotspot Signing` in Keychain Access (Certificate Assistant → Create a Certificate → Code
+Signing) — `hotspotd menubar --rebuild` prefers it automatically, and a stable identity's
+Location grant survives rebuilds. `hotspotd doctor` tells you which situation you're in.
 
 ## Usage
 
@@ -41,80 +80,100 @@ after installing you can call it from anywhere. Open a new shell or run `hash -r
 caches command lookups. If no writable `PATH` directory exists, the installer says so and you call
 `bin/hotspotd` by path instead.
 
-Because it is a symlink rather than a copy, `git pull` updates the command in place. `hotspotd`
-resolves its own real path to find `libexec/` and `menubar/`, so moving the checkout breaks the
-link — re-run `./install.sh` after moving it.
-
 | Subcommand | What it does |
 |---|---|
-| `on` | Enables the agent: flips `ENABLED=1` in the config and runs `launchctl enable`. |
-| `off` | Disables the agent: flips `ENABLED=0` and runs `launchctl disable`. |
-| `status` | Prints whether the agent is loaded, enabled, and when it last ran. Add `--json` for machine-readable output. |
-| `check` | Runs one reachability check immediately, outside the schedule. |
+| `on` | Enables auto-join: flips `ENABLED=1` in the config and runs `launchctl enable`. |
+| `off` | Disables auto-join: flips `ENABLED=0` and runs `launchctl disable`. |
+| `status` | Prints whether the agent is loaded, enabled, and its current state. Add `--json` for machine-readable output. |
+| `check` | Runs one degraded-mode reachability/join check immediately (see below), outside the app's own loop. |
+| `doctor` | Prints an OK/WARN/FAIL checklist covering install state, launchd, the watcher process, Location authorization, the saved SSID, Wi-Fi power, the current router, and the code signature. Run this first whenever a join isn't happening. |
 | `logs` | Prints the log file. Add `-f` to follow it, `--open` to open it in the default app. |
 | `install` | Runs the installer (same as `./install.sh`). |
 | `uninstall` | Runs the uninstaller (same as `./uninstall.sh`). |
-| `menubar` | Builds and launches the menu bar toggle app. |
+| `menubar` | Launches the already-installed app. Add `--rebuild` to compile, re-sign, and reinstall it first. |
 
-`status --json` reports `enabled`, `agent_installed`, `agent_loaded`, `online`, `ssid`,
-`ssid_current`, `interface`, `wifi_power`, `check_interval`, `cooldown`, `log_path`, and
-`config_path`. The menu bar app renders all of them.
+`status --json` reports 16 keys: `enabled`, `agent_installed`, `agent_loaded`, `watcher_running`,
+`location_authorized`, `online`, `ssid`, `ssid_current`, `interface`, `wifi_power`,
+`check_interval`, `cooldown`, `hotspot_router`, `last_join_result`, `log_path`, `config_path`. The
+menu bar app renders all of them.
 
-`on` and `off` both flip the config flag and call `launchctl enable`/`disable`. Pausing or resuming the agent never requires a reinstall.
+`on` and `off` both flip the config flag and call `launchctl enable`/`disable`. Pausing or resuming
+never requires a reinstall or rebuild.
 
 ## Configuration
 
 Config lives at `~/.config/auto-hotspot/config` and is sourced as a shell file. Keys:
 
-- `SSID` — hotspot network name. Default `Andrew’s iPhone`. The apostrophe is U+2019 (RIGHT SINGLE QUOTATION MARK), not the ASCII `'`. If you retype this SSID with an ASCII apostrophe, the join will silently fail to match your iPhone's actual network name.
-- `CHECK_INTERVAL` — seconds between checks. Default 120.
-- `COOLDOWN` — minimum seconds between join attempts after a failure. Default 300.
-- `ENABLED` — `1` or `0`. Whether the agent should act on a check.
+- `SSID` — hotspot network name. Default `Andrew’s iPhone`. The apostrophe is U+2019 (RIGHT SINGLE
+  QUOTATION MARK), not the ASCII `'`. If you retype this SSID with an ASCII apostrophe, the join
+  will silently fail to match your iPhone's actual network name.
+- `CHECK_INTERVAL` — seconds between the app's safety-net poll, which only matters if the
+  event-driven watcher (`NWPathMonitor` plus sleep/wake notifications) somehow misses a
+  transition. Default 300. This is no longer a periodic launchd timer — the app is a persistent
+  process and reacts to network changes within seconds, not on a fixed clock.
+- `COOLDOWN` — minimum seconds between join attempts after a failure. Default 30 (lowered from an
+  earlier 300s default, now that joins are triggered by real events instead of a slow poll).
+- `ENABLED` — `1` or `0`. Whether the agent should act on a state change.
 - `WIFI_INTERFACE` — Wi-Fi device name. Default `en0`.
-- `HOTSPOTD_BIN` — absolute path to `bin/hotspotd`, written by `install.sh`. The menu bar app reads this to find the CLI.
+- `HOTSPOT_ROUTER` — the iPhone tethering gateway IP. Default `172.20.10.1`. A join is only ever
+  reported as successful when the interface's router matches this value AND the reachability
+  probe succeeds — `networksetup`'s own exit code is not trusted (see below).
+- `NOTIFY` — `1` or `0`. Whether the app posts a user notification on join/failure. Default 1.
+- `HOTSPOTD_BIN` — absolute path to `bin/hotspotd`, written by `install.sh`. The app reads this to
+  find the CLI.
 
-Changing `CHECK_INTERVAL` requires re-running `./install.sh`, because the interval is baked into the launchd plist. Every other key is picked up on the next scheduled check, no reinstall needed.
+Every key is picked up live — no reinstall or rebuild needed for a config change to take effect.
 
-## How the check works
+## How it works
 
-Each run does a reachability probe, because a bare ping or open port isn't enough to prove real internet access:
+The old design was a periodic launchd timer running a bare shell script on a fixed clock. That shape could
+never really work on macOS 26: a script has no process identity to hold a Location Services grant,
+so it can never see a real SSID, and it had no way to tell a genuine join from
+`networksetup`'s false "success". The current design fixes both problems by turning the signed app
+itself into the agent:
 
-1. `nc -z -G 3 1.1.1.1 53` — routed for the log line only; its result doesn't decide anything on its own.
-2. `curl -sS -m 4 http://captive.apple.com/hotspot-detect.html` — the response body must contain `<TITLE>Success</TITLE>`. A bare HTTP 200 isn't accepted, because captive portals also return 200 with a login page as the body. This check alone decides online vs. offline.
-
-If the probe reports offline, the script:
-
-1. Makes sure Wi-Fi power is on.
-2. Runs `networksetup -setairportnetwork en0 "$SSID"` with no password argument — the keychain supplies it.
-3. Waits 5 seconds for the join to settle.
-4. Re-probes up to 3 times.
-
-A cooldown timestamp at `~/.local/state/auto-hotspot/last-join-attempt` limits failed joins to one attempt per `COOLDOWN` seconds, so a persistently unreachable hotspot doesn't get hammered. A `mkdir`-based lock directory prevents two runs from overlapping.
+1. **launchd** loads `AutoHotspot.app` with `KeepAlive=true` and `RunAtLoad=true` — a persistent
+   process, not a periodic invocation, and carries no timer key in the plist.
+2. **The watcher**, running inside that process, reacts to four sources: `NWPathMonitor` path
+   transitions, `NSWorkspace.didWakeNotification` on wake from sleep, a coalescing safety-net
+   timer at `CHECK_INTERVAL`, and a trigger file the CLI can touch to force an immediate check.
+   Reaction time to a real network change is on the order of seconds, not minutes.
+3. **The join engine**, also inside that process, does `CLLocationManager` authorization once at
+   first launch, then uses `CWInterface.scanForNetworks(withSSID:)` and `associateToNetwork:` —
+   the only code path in this project that can see and join networks on macOS 26, because it's
+   the only code path that can hold the Location grant.
+4. **Verification is permission-free everywhere**: a join (or an existing connection) only counts
+   as real when `ipconfig getoption en0 router` equals `HOTSPOT_ROUTER` *and* the captive-portal
+   reachability probe succeeds. `networksetup`'s own exit code is never trusted — it returns 0
+   whether the join actually happened or not.
+5. **`bin/hotspotd`** stays Wi-Fi-free. It renders `status` by merging its own probe with
+   `agent.status`, a JSON file the app writes with the fields only it can know (real SSID,
+   `location_authorized`, `watcher_running`, `last_join_result`); flips `ENABLED`; and asks the
+   running agent to act immediately by touching the trigger file.
+6. **`libexec/auto-hotspot-check.sh`** is the degraded-mode fallback for when the app isn't
+   running at all — reachability probing plus a best-effort `networksetup` join, verified against
+   the same router-fingerprint check as the app, so it can never report a false success either.
 
 ## Logs
 
-- `~/Library/Logs/auto-hotspot.log` — the script's own log, ISO-8601 timestamps with UTC offset. Rotates to `.log.1` once it hits 1 MB.
-- `~/Library/Logs/auto-hotspot.launchd.out` and `.launchd.err` — launchd's own stdout/stderr capture for the agent.
+- `~/Library/Logs/auto-hotspot.log` — shared log for both the app and the fallback script,
+  ISO-8601 timestamps with UTC offset. Rotates to `.log.1` once it hits 1 MB.
+- `~/Library/Logs/auto-hotspot.launchd.out` and `.launchd.err` — launchd's own stdout/stderr
+  capture for the agent process.
 
 ## Menu bar app
 
-`bin/hotspotd menubar` compiles `menubar/AutoHotspot.swift` with `swiftc`, bundles the result into `build/AutoHotspot.app`, ad-hoc signs it with:
+The app lives at `~/Applications/AutoHotspot.app`, built from `menubar/AutoHotspot.swift` and
+`menubar/Wifi.swift`. `hotspotd menubar` launches the already-installed copy without touching it;
+`hotspotd menubar --rebuild` recompiles, re-signs, and reinstalls it — see "One-time Location
+Services prompt" above for why that distinction matters.
 
-```
-codesign --force --deep --sign - build/AutoHotspot.app
-```
+The status item icon is the `personalhotspot` SF Symbol, dimmed and slashed when auto-join is
+paused. The menu shows a headline status line, the target hotspot, and a **Settings** submenu
+listing every field from `status --json`, plus **Edit Config…** and **Reveal Log in Finder**.
 
-strips the quarantine attribute, and launches it. The app has no logic of its own — it shells out
-to `hotspotd` for every action.
-
-The menu bar icon is the `personalhotspot` SF Symbol, dimmed and slashed when auto-join is paused.
-The menu shows a headline status line (green online / red offline / orange Wi-Fi off), the target
-hotspot, and a **Settings** submenu listing the interface, check interval, retry cooldown, agent
-state, log path, and config path, plus **Edit Config…** and **Reveal Log in Finder**.
-
-To have it start at login, add `build/AutoHotspot.app` to Login Items yourself; the installer
-doesn't do this for you. Note that `build/` is gitignored, so a fresh clone must run
-`hotspotd menubar` once to build the app.
+To have it start at login, add `~/Applications/AutoHotspot.app` to Login Items yourself; the
+installer doesn't do this for you.
 
 ## Uninstall
 
@@ -126,6 +185,10 @@ Add `--purge` to also remove the config, state directory, and logs.
 
 ## Troubleshooting
 
+Run `hotspotd doctor` first — it checks install state, launchd, the watcher process, Location
+authorization, the saved SSID, Wi-Fi power, the current router, and the code signature in one
+pass, and tells you exactly which one is failing.
+
 - **Is the agent loaded?**
 
 ```
@@ -134,10 +197,25 @@ launchctl print gui/$(id -u)/com.andrewwang.autohotspot
 
 Exit code 113 means it isn't loaded.
 
-- **`airport` command not found.** The legacy `airport` binary no longer exists on macOS 26. This project doesn't use it.
-- **`wdutil info` needs sudo.** This project avoids sudo entirely, so it doesn't use `wdutil` either.
-- **`networksetup -getairportnetwork en0` says "You are not associated with an AirPort network."** That's normal when Wi-Fi is idle or on Ethernet, not an error condition.
-- **Join fails with a privileges complaint in the log.** Join the hotspot once by hand from the Wi-Fi menu. That stores the credential for your user account, after which the script's join will work.
+- **`airport` command not found.** The legacy `airport` binary no longer exists on macOS 26. This
+  project doesn't use it.
+- **`wdutil info` needs sudo.** This project avoids sudo entirely, so it doesn't use `wdutil`
+  either.
+- **`networksetup -getairportnetwork en0` says "You are not associated with an AirPort network."**
+  Normal on macOS 26 even while genuinely connected — SSID visibility there is gated behind
+  Location Services for every process. This is exactly why the join engine lives in the signed
+  app rather than a plain script.
+- **The menu bar shows `ssid_current` as `<redacted>`.** Same cause: something (usually
+  `ipconfig getsummary`) is reading the SSID without the Location grant. Check `location_authorized`
+  in `status --json` — if it's `false`, re-launch the app and approve the prompt.
+- **Location keeps re-prompting after every rebuild.** You're on an ad-hoc signature, which
+  rotates its cdhash on every build. Create the `AutoHotspot Signing` identity described above.
+- **Join fails with a privileges complaint in the log.** Join the hotspot once by hand from the
+  Wi-Fi menu. That stores the credential for your user account, after which the app's join will
+  work.
+- **Nothing joins even though the phone is nearby.** Check "Allow Others to Join" on the iPhone
+  (see the top of this README) — with it off, no amount of software on the Mac side can wake the
+  hotspot.
 
 ## License
 

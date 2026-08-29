@@ -4,12 +4,46 @@ set -uo pipefail
 
 LABEL="com.andrewwang.autohotspot"
 PLIST="$HOME/Library/LaunchAgents/com.andrewwang.autohotspot.plist"
+# Backstop LaunchAgent (see install.sh / share/*.checker.plist.template):
+# runs the degraded-mode worker on a timer so reconnection still happens if
+# the watcher above is down or crash-looping.
+CHECKER_LABEL="com.andrewwang.autohotspot.checker"
 CONFIG="${AUTO_HOTSPOT_CONFIG:-$HOME/.config/auto-hotspot/config}"
 LOG="${AUTO_HOTSPOT_LOG:-$HOME/Library/Logs/auto-hotspot.log}"
 STATE_DIR="${AUTO_HOTSPOT_STATE:-$HOME/.local/state/auto-hotspot}"
 
+# The app bundle is the agent now (see CLAUDE.md "shared contract"). It lives
+# at a fixed path outside this checkout so TCC identity survives rebuilds.
+APP_PATH="$HOME/Applications/AutoHotspot.app"
+AGENT_EXEC="$APP_PATH/Contents/MacOS/AutoHotspot"
+
+# New state files the app writes/reads; last-join-attempt and lock are unchanged.
+TRIGGER_FILE="$STATE_DIR/trigger"
+AGENT_STATUS_FILE="$STATE_DIR/agent.status"
+# The full installed path, not just "AutoHotspot.app/Contents/MacOS/AutoHotspot":
+# that substring also matches a locally-built build/AutoHotspot.app binary
+# during development, which would make `hotspotd check`/`doctor` mistake a
+# dev build for the real agent. $AGENT_EXEC is already the unique full path.
+AGENT_PROCESS_PATTERN="$AGENT_EXEC"
+
+# agent.status is considered stale (and its fields ignored) once older than this.
+AGENT_STATUS_MAX_AGE=600
+
 SELF="$0"
-while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+_symlink_hops=0
+while [ -L "$SELF" ]; do
+  _symlink_hops=$((_symlink_hops + 1))
+  if [ "$_symlink_hops" -gt 20 ]; then
+    echo "hotspotd: too many symlink levels resolving $0" >&2
+    exit 1
+  fi
+  _target="$(readlink "$SELF")"
+  case "$_target" in
+    /*) SELF="$_target" ;;
+    *) SELF="$(dirname "$SELF")/$_target" ;;
+  esac
+done
+unset _symlink_hops _target
 BIN_DIR="$(cd "$(dirname "$SELF")" && pwd -P)"
 ROOT="$(cd "$BIN_DIR/.." && pwd -P)"
 CHECKER="$ROOT/libexec/auto-hotspot-check.sh"
@@ -17,12 +51,17 @@ CHECKER="$ROOT/libexec/auto-hotspot-check.sh"
 err() { echo "hotspotd: $*" >&2; }
 
 load_config() {
+  # U+2019 RIGHT SINGLE QUOTATION MARK, encoded as the raw UTF-8 octal escape
+  # so no editor/shell normalizes it to ASCII '. See the matching literal
+  # (with this same comment) in libexec/auto-hotspot-check.sh.
   SSID=$(printf 'Andrew\342\200\231s iPhone')
-  CHECK_INTERVAL=120
+  CHECK_INTERVAL=300
   ENABLED=1
-  COOLDOWN=300
+  COOLDOWN=30
   WIFI_INTERFACE=en0
   HOTSPOTD_BIN=""
+  HOTSPOT_ROUTER="172.20.10.1"
+  NOTIFY=1
   if [ -f "$CONFIG" ]; then
     . "$CONFIG"
   fi
@@ -47,7 +86,61 @@ config_set() {
 }
 
 json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+  # Escapes backslash and double-quote, then walks the (now-escaped) string
+  # byte-by-byte under LC_ALL=C to \u00XX-escape every C0 control character
+  # (0x00-0x1F: newline, tab, CR, and the rest) without disturbing multi-byte
+  # UTF-8 sequences — a UTF-8 continuation byte reads as negative under
+  # LC_ALL=C's signed `printf '%d' "'c"`, so the "< 32 and >= 0" test passes
+  # it through untouched.
+  (
+    export LC_ALL=C
+    s="$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    n=${#s}
+    i=0
+    out=""
+    while [ "$i" -lt "$n" ]; do
+      c="${s:$i:1}"
+      ord="$(printf '%d' "'$c")"
+      if [ "$ord" -ge 0 ] && [ "$ord" -lt 32 ]; then
+        out="$out$(printf '\\u%04x' "$ord")"
+      else
+        out="$out$c"
+      fi
+      i=$((i + 1))
+    done
+    printf '%s' "$out"
+  )
+}
+
+# agent_status_field KEY TYPE(bool|string) DEFAULT
+# Reads one field out of $AGENT_STATUS_FILE (JSON the agent writes). Falls
+# back to DEFAULT when the file is missing, older than
+# $AGENT_STATUS_MAX_AGE seconds, or doesn't contain the key.
+agent_status_field() {
+  key="$1"
+  typ="$2"
+  default="$3"
+  if [ ! -f "$AGENT_STATUS_FILE" ]; then
+    printf '%s' "$default"
+    return 0
+  fi
+  mtime="$(/usr/bin/stat -f%m "$AGENT_STATUS_FILE" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  age=$((now - mtime))
+  if [ "$age" -gt "$AGENT_STATUS_MAX_AGE" ]; then
+    printf '%s' "$default"
+    return 0
+  fi
+  if [ "$typ" = "bool" ]; then
+    val="$(sed -n "s/.*\"$key\" *: *\\(true\\|false\\).*/\\1/p" "$AGENT_STATUS_FILE" 2>/dev/null | head -1)"
+  else
+    val="$(sed -n "s/.*\"$key\" *: *\"\\([^\"]*\\)\".*/\\1/p" "$AGENT_STATUS_FILE" 2>/dev/null | head -1)"
+  fi
+  if [ -z "$val" ]; then
+    printf '%s' "$default"
+  else
+    printf '%s' "$val"
+  fi
 }
 
 current_ssid() {
@@ -109,14 +202,21 @@ cmd_status() {
     e_ssid_current="$(json_escape "$ssid_current")"
     e_iface="$(json_escape "$WIFI_INTERFACE")"
     e_power="$(json_escape "$power")"
+    e_router="$(json_escape "$HOTSPOT_ROUTER")"
     e_log="$(json_escape "$LOG")"
     e_config="$(json_escape "$CONFIG")"
+    # watcher_running, location_authorized, and last_join_result come from the
+    # agent's own status file (agent.status), defaulting to false/empty when
+    # it's absent or stale (see agent_status_field).
+    watcher_running_b="$(agent_status_field watcher_running bool false)"
+    location_authorized_b="$(agent_status_field location_authorized bool false)"
+    e_last_join_result="$(json_escape "$(agent_status_field last_join_result string "")")"
     if [ "$ENABLED" = "1" ]; then enabled_b=true; else enabled_b=false; fi
     if [ "$loaded" -eq 1 ]; then loaded_b=true; else loaded_b=false; fi
     if [ "$online" -eq 1 ]; then online_b=true; else online_b=false; fi
     if [ "$installed" -eq 1 ]; then installed_b=true; else installed_b=false; fi
-    printf '{"enabled":%s,"agent_installed":%s,"agent_loaded":%s,"online":%s,"ssid":"%s","ssid_current":"%s","interface":"%s","wifi_power":"%s","check_interval":%s,"cooldown":%s,"log_path":"%s","config_path":"%s"}\n' \
-      "$enabled_b" "$installed_b" "$loaded_b" "$online_b" "$e_ssid" "$e_ssid_current" "$e_iface" "$e_power" "$CHECK_INTERVAL" "$COOLDOWN" "$e_log" "$e_config"
+    printf '{"enabled":%s,"agent_installed":%s,"agent_loaded":%s,"watcher_running":%s,"location_authorized":%s,"online":%s,"ssid":"%s","ssid_current":"%s","interface":"%s","wifi_power":"%s","check_interval":%s,"cooldown":%s,"hotspot_router":"%s","last_join_result":"%s","log_path":"%s","config_path":"%s"}\n' \
+      "$enabled_b" "$installed_b" "$loaded_b" "$watcher_running_b" "$location_authorized_b" "$online_b" "$e_ssid" "$e_ssid_current" "$e_iface" "$e_power" "$CHECK_INTERVAL" "$COOLDOWN" "$e_router" "$e_last_join_result" "$e_log" "$e_config"
     return 0
   fi
 
@@ -142,6 +242,7 @@ cmd_status() {
   echo "  check interval:    ${CHECK_INTERVAL}s"
   echo "  cooldown:          ${COOLDOWN}s"
   echo "  interface:         $WIFI_INTERFACE"
+  echo "  hotspot router:    $HOTSPOT_ROUTER"
   echo "  wifi power:        $power"
   if [ -n "$ssid_current" ]; then
     echo "  current SSID:      $ssid_current"
@@ -172,6 +273,18 @@ cmd_status() {
 
 cmd_check() {
   load_config
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  if pgrep -qf "$AGENT_PROCESS_PATTERN" >/dev/null 2>&1; then
+    # The agent owns joining while it's running; poke its trigger file
+    # instead of racing it with the degraded-mode worker.
+    touch "$TRIGGER_FILE" 2>/dev/null
+    echo "auto-hotspot: agent is running, triggered an immediate check"
+    sleep 1
+    if [ -f "$LOG" ]; then
+      tail -n 10 "$LOG"
+    fi
+    return 0
+  fi
   if [ ! -f "$CHECKER" ]; then
     err "checker not found at $CHECKER"
     return 1
@@ -230,35 +343,148 @@ cmd_uninstall() {
 
 cmd_menubar() {
   load_config
+  rebuild=0
   build_only=0
   for a in "$@"; do
-    if [ "$a" = "--build-only" ]; then
-      build_only=1
-    fi
+    case "$a" in
+      --rebuild) rebuild=1 ;;
+      --build-only) build_only=1 ;;
+    esac
   done
 
-  mkdir -p "$ROOT/build"
-  swiftc -O -o "$ROOT/build/AutoHotspot" "$ROOT/menubar/AutoHotspot.swift"
+  # Bare `hotspotd menubar`: never rebuild. Rebuilding rotates the ad-hoc
+  # cdhash (or would touch the stable identity unnecessarily) and silently
+  # revokes the Location Services grant. Just launch what's already
+  # installed at the fixed path outside this checkout.
+  if [ "$rebuild" -eq 0 ] && [ "$build_only" -eq 0 ]; then
+    if [ ! -x "$AGENT_EXEC" ]; then
+      err "AutoHotspot.app is not installed at $APP_PATH. Run: hotspotd menubar --rebuild"
+      return 1
+    fi
+    open -g "$APP_PATH"
+    return 0
+  fi
+
+  # --rebuild and/or --build-only: compile, sign, and reinstall the bundle.
+  mkdir -p "$ROOT/build/AutoHotspot.app/Contents/MacOS"
+  swiftc -O -o "$ROOT/build/AutoHotspot.app/Contents/MacOS/AutoHotspot" \
+    "$ROOT/menubar/AutoHotspot.swift" "$ROOT/menubar/Wifi.swift"
   rc=$?
   if [ $rc -ne 0 ]; then
     err "swiftc build failed"
     return 1
   fi
-
-  mkdir -p "$ROOT/build/AutoHotspot.app/Contents/MacOS"
-  cp "$ROOT/build/AutoHotspot" "$ROOT/build/AutoHotspot.app/Contents/MacOS/AutoHotspot"
   cp "$ROOT/menubar/Info.plist" "$ROOT/build/AutoHotspot.app/Contents/Info.plist"
 
-  codesign --force --deep --sign - "$ROOT/build/AutoHotspot.app"
+  # Prefer a stable, user-created signing identity over ad-hoc so the
+  # designated requirement (and the Location Services grant keyed to it)
+  # survives rebuilds. Never use --deep: it's deprecated and re-signs
+  # nested content we don't have.
+  if security find-identity -v -p codesigning 2>/dev/null | grep -q 'AutoHotspot Signing'; then
+    codesign --force --options runtime --identifier com.andrewwang.autohotspot.menubar \
+      --sign 'AutoHotspot Signing' "$ROOT/build/AutoHotspot.app"
+  else
+    codesign --force --options runtime --identifier com.andrewwang.autohotspot.menubar \
+      --sign - "$ROOT/build/AutoHotspot.app"
+    err "warning: signed ad-hoc (no 'AutoHotspot Signing' identity found in the keychain)."
+    err "warning: the ad-hoc signature rotates on every rebuild, so macOS will re-prompt for Location access each time."
+    err "warning: create a self-signed codesigning identity named 'AutoHotspot Signing' (Keychain Access > Certificate Assistant) to keep it stable."
+  fi
   xattr -dr com.apple.quarantine "$ROOT/build/AutoHotspot.app" 2>/dev/null || true
 
-  pkill -f 'AutoHotspot.app/Contents/MacOS/AutoHotspot' 2>/dev/null || true
+  mkdir -p "$HOME/Applications"
+  pkill -f "$AGENT_EXEC" 2>/dev/null || true
+  rm -rf "$APP_PATH"
+  ditto "$ROOT/build/AutoHotspot.app" "$APP_PATH"
 
   config_set HOTSPOTD_BIN "$BIN_DIR/hotspotd"
 
   if [ "$build_only" -eq 0 ]; then
-    open "$ROOT/build/AutoHotspot.app"
+    open -g "$APP_PATH"
   fi
+}
+
+cmd_doctor() {
+  load_config
+  finding() {
+    printf '%s %s\n' "$1" "$2"
+  }
+
+  if [ -x "$AGENT_EXEC" ]; then
+    finding OK "agent installed at $APP_PATH"
+  else
+    finding FAIL "agent not installed at $APP_PATH (run: hotspotd menubar --rebuild)"
+  fi
+
+  if agent_loaded; then
+    finding OK "launchd job $LABEL is loaded"
+  else
+    finding FAIL "launchd job $LABEL is not loaded (run: hotspotd install)"
+  fi
+
+  if launchctl print "gui/$(id -u)/$CHECKER_LABEL" >/dev/null 2>&1; then
+    finding OK "backstop launchd job $CHECKER_LABEL is loaded"
+  else
+    finding WARN "backstop launchd job $CHECKER_LABEL is not loaded (run: hotspotd install) — no automatic reconnection if the watcher above is down"
+  fi
+
+  if pgrep -qf "$AGENT_PROCESS_PATTERN" >/dev/null 2>&1; then
+    finding OK "watcher process is running"
+  else
+    finding WARN "watcher process is not running"
+  fi
+
+  watcher_running="$(agent_status_field watcher_running bool false)"
+  if [ "$watcher_running" = "true" ]; then
+    finding OK "agent reports watcher_running=true"
+  else
+    finding WARN "agent status file missing/stale or reports watcher_running=false"
+  fi
+
+  location_authorized="$(agent_status_field location_authorized bool false)"
+  if [ "$location_authorized" = "true" ]; then
+    finding OK "Location Services authorized"
+  else
+    finding FAIL "Location Services not authorized (required to see real SSIDs on macOS 26)"
+  fi
+
+  preferred="$(networksetup -listpreferredwirelessnetworks "$WIFI_INTERFACE" 2>/dev/null)"
+  case "$preferred" in
+    *"$SSID"*)
+      finding OK "target SSID \"$SSID\" is in the saved-network list"
+      ;;
+    *)
+      finding WARN "target SSID \"$SSID\" not in the saved-network list (join it once manually to save it)"
+      ;;
+  esac
+
+  power="$(wifi_power)"
+  case "$power" in
+    On) finding OK "Wi-Fi power is on" ;;
+    Off) finding WARN "Wi-Fi power is off" ;;
+    *) finding WARN "could not determine Wi-Fi power" ;;
+  esac
+
+  router_now="$(ipconfig getoption "$WIFI_INTERFACE" router 2>/dev/null)"
+  if [ -z "$router_now" ]; then
+    finding WARN "could not determine current router"
+  elif [ "$router_now" = "$HOTSPOT_ROUTER" ]; then
+    finding OK "current router $router_now matches the configured hotspot router"
+  else
+    finding WARN "current router is $router_now, not the hotspot router ($HOTSPOT_ROUTER)"
+  fi
+
+  if [ -x "$AGENT_EXEC" ]; then
+    if codesign -dvvv "$AGENT_EXEC" 2>&1 | grep -q '^Signature=adhoc'; then
+      finding WARN "ad-hoc code signature (rotates on every rebuild, revokes the Location grant each time)"
+    else
+      finding OK "code signature is stable (not ad-hoc)"
+    fi
+  else
+    finding WARN "cannot check code signature: agent is not installed"
+  fi
+
+  return 0
 }
 
 cmd_help() {
@@ -271,10 +497,11 @@ subcommands:
   off             disable auto-hotspot (flips config; does not require install)
   status          show current status (add --json for machine-readable output)
   check           run one check/join cycle immediately, ignoring cooldown
+  doctor          print OK/WARN/FAIL diagnostics for everything that can go wrong
   logs            show recent log lines (logs [N] | logs -f | logs --open)
   install         install the launchd agent (delegates to install.sh)
   uninstall       remove the launchd agent (delegates to uninstall.sh)
-  menubar         build, sign, and launch the menu bar app
+  menubar         launch the installed menu bar app (menubar --rebuild to build, sign, and reinstall it)
   help            show this help
   version         print the version
 
@@ -297,6 +524,7 @@ main() {
     off) cmd_off "$@" ;;
     status) cmd_status "$@" ;;
     check) cmd_check "$@" ;;
+    doctor) cmd_doctor "$@" ;;
     logs) cmd_logs "$@" ;;
     install) cmd_install "$@" ;;
     uninstall) cmd_uninstall "$@" ;;

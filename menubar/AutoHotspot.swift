@@ -1,5 +1,7 @@
 import Cocoa
 import Foundation
+import Network
+import CoreWLAN
 
 // MARK: - hotspotd location
 
@@ -63,6 +65,230 @@ func abbreviateHome(_ path: String) -> String {
     return path
 }
 
+// MARK: - Watcher
+//
+// The event-driven agent core. Four sources funnel onto one serial queue,
+// debounced to at most one evaluation per 5 seconds:
+//   (a) NWPathMonitor           - path transitions (verified: no TCC needed, no hot-spin)
+//   (b) NSWorkspace wake        - sleep/wake so a dropped join survives suspend
+//   (c) a self-rescheduling timer at CHECK_INTERVAL - safety net, config reread each fire
+//   (d) a file-system-object source on $STATE_DIR/trigger - lets the CLI poke a running agent
+//
+// Deliberately NOT `scutil -w`: on this machine (macOS 26) that loop returns
+// in ~5ms on an existing key and there is no `n.wait` subcommand to block on,
+// so it would burn a core. NWPathMonitor already covers the same transitions.
+final class Watcher {
+    static let shared = Watcher()
+
+    private let queue = DispatchQueue(label: "com.andrewwang.autohotspot.watcher")
+    private var pathMonitor: NWPathMonitor?
+    private var safetyTimer: DispatchSourceTimer?
+    private var triggerSource: DispatchSourceFileSystemObject?
+    private var triggerFD: Int32 = -1
+    private var wakeObserver: NSObjectProtocol?
+
+    private var lastEvalTime: Date = .distantPast
+    private var debounceWorkItem: DispatchWorkItem?
+    private var offlineEpisodeNotified = false
+    // Set when a cycle sees .alreadyJoined but then fails verification — the
+    // next join() call forces a disassociate+rejoin instead of repeating the
+    // identical alreadyJoined->verify-fail loop forever.
+    private var forceRejoinNext = false
+
+    private init() {}
+
+    func start() {
+        requestNotificationAuthorizationIfNeeded()
+        startPathMonitor()
+        startWakeObserver()
+        startTriggerWatch()
+        queue.async { [weak self] in self?.scheduleSafetyTimer() }
+        // RunAtLoad implies "a check just happened" — run one immediately.
+        queue.async { [weak self] in self?.performEvaluation(reason: "startup") }
+    }
+
+    /// Lets `hotspotd check`'s successor (or a human) wake the agent without
+    /// waiting for the trigger-file round trip.
+    func triggerNow(reason: String) {
+        queue.async { [weak self] in self?.scheduleDebounced(reason: reason) }
+    }
+
+    private func startPathMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            // Already invoked on `queue` below via start(queue:).
+            self?.scheduleDebounced(reason: "path-update:\(path.status)")
+        }
+        monitor.start(queue: queue)
+        pathMonitor = monitor
+    }
+
+    private func startWakeObserver() {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.queue.async { self.scheduleDebounced(reason: "wake") }
+        }
+    }
+
+    private func startTriggerWatch() {
+        let path = WifiPaths.triggerPath
+        ensureFileExists(atPath: path)
+        let fd = open(path, O_EVTONLY)
+        guard fd >= 0 else {
+            wifiLog("error", "trigger watch: could not open \(path)")
+            return
+        }
+        triggerFD = fd
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .attrib, .extend, .delete, .rename], queue: queue)
+        source.setEventHandler { [weak self, weak source] in
+            guard let self = self else { return }
+            let flags = source?.data ?? []
+            if flags.contains(.delete) || flags.contains(.rename) {
+                // The trigger file was replaced rather than touched-in-place;
+                // re-open on the same path so future pokes still land.
+                source?.cancel()
+                self.startTriggerWatch()
+                return
+            }
+            self.scheduleDebounced(reason: "trigger")
+        }
+        source.setCancelHandler { [weak self] in
+            if let fd = self?.triggerFD, fd >= 0 { close(fd) }
+        }
+        source.resume()
+        triggerSource = source
+    }
+
+    /// Self-rescheduling rather than a fixed-period repeat: each fire reads
+    /// CHECK_INTERVAL fresh from disk before arming the next one, so editing
+    /// the config takes effect without a restart.
+    private func scheduleSafetyTimer() {
+        safetyTimer?.cancel()
+        let config = loadRuntimeConfig()
+        let interval = max(30, config.checkInterval)
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + .seconds(interval))
+        timer.setEventHandler { [weak self] in
+            self?.scheduleDebounced(reason: "safety-net")
+            self?.scheduleSafetyTimer()
+        }
+        timer.resume()
+        safetyTimer = timer
+    }
+
+    /// Must run on `queue`. Coalesces bursts (Wi-Fi power-cycles fire path
+    /// updates several times in under a second) into one evaluation.
+    private func scheduleDebounced(reason: String) {
+        let now = Date()
+        let elapsed = now.timeIntervalSince(lastEvalTime)
+        debounceWorkItem?.cancel()
+        if elapsed >= 5 {
+            performEvaluation(reason: reason)
+        } else {
+            let delay = 5 - elapsed
+            let work = DispatchWorkItem { [weak self] in self?.performEvaluation(reason: reason) }
+            debounceWorkItem = work
+            queue.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+    }
+
+    /// Must run on `queue`. This is the whole contract from the plan:
+    /// disabled -> skip; online -> clear cooldown stamp; offline within
+    /// cooldown -> log and skip; otherwise stamp then attempt the join.
+    private func performEvaluation(reason: String) {
+        lastEvalTime = Date()
+        let config = loadRuntimeConfig()
+
+        guard config.enabled else {
+            wifiLog("info", "evaluate (\(reason)): disabled, skipping")
+            return
+        }
+
+        guard acquireLock() else {
+            wifiLog("warn", "evaluate (\(reason)): another check is running, skipping")
+            return
+        }
+        defer { releaseLock() }
+
+        let ssidNow = CWWiFiClient.shared().interface()?.ssid() ?? ""
+        let locationAuthorized = WifiEngine.shared.isLocationAuthorized()
+
+        if probeOnline(interface: config.interface) {
+            wifiLog("info", "evaluate (\(reason)): online via \(ssidNow.isEmpty ? "other/none" : ssidNow)")
+            clearLastJoinAttempt()
+            offlineEpisodeNotified = false
+            writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
+                              ssidCurrent: ssidNow, lastJoinResult: "online")
+            return
+        }
+
+        if let last = readLastJoinAttempt() {
+            let elapsed = Date().timeIntervalSince1970 - last
+            if elapsed < Double(config.cooldown) {
+                let remaining = Int(Double(config.cooldown) - elapsed)
+                wifiLog("info", "evaluate (\(reason)): offline but in cooldown (\(remaining)s left), skipping")
+                return
+            }
+        }
+
+        // Stamp BEFORE attempting the join so a crash mid-attempt still throttles.
+        writeLastJoinAttempt()
+
+        // Restore Wi-Fi power before touching anything else: a radio left
+        // off (e.g. by sleep/wake) makes scanning and association fail in a
+        // way indistinguishable from "hotspot not found" unless this is
+        // checked first. Mirrors the shell fallback's power-cycle recovery.
+        guard WifiEngine.shared.ensureWifiPowerOn() else {
+            wifiLog("error", "evaluate (\(reason)): Wi-Fi is off and could not be turned back on")
+            writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
+                              ssidCurrent: ssidNow, lastJoinResult: JoinResult.wifiOff.rawValue)
+            if config.notify && !offlineEpisodeNotified {
+                offlineEpisodeNotified = true
+                postOfflineNotification(ssid: config.ssid, result: .wifiOff, locationAuthorized: locationAuthorized)
+            }
+            return
+        }
+
+        wifiLog("info", "evaluate (\(reason)): offline, attempting join to \(config.ssid)")
+        let result = WifiEngine.shared.join(ssid: config.ssid, forceRejoin: forceRejoinNext)
+        forceRejoinNext = false
+
+        var verified = false
+        if result == .success || result == .alreadyJoined {
+            // Give DHCP a moment to hand out a lease before checking the
+            // router fingerprint, matching the shell worker's settle time.
+            Thread.sleep(forTimeInterval: 3)
+            verified = verifyJoin(config: config)
+        }
+
+        if verified {
+            wifiLog("info", "evaluate (\(reason)): joined \u{201C}\(config.ssid)\u{201D} and verified online")
+            clearLastJoinAttempt()
+            offlineEpisodeNotified = false
+            writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
+                              ssidCurrent: config.ssid, lastJoinResult: "success")
+        } else {
+            if result == .alreadyJoined {
+                // Stale association: verifyJoin failed against an SSID we
+                // were already on. Force a real disassociate+rescan+rejoin
+                // next cycle instead of reporting the same alreadyJoined
+                // shortcut and looping forever.
+                forceRejoinNext = true
+            }
+            wifiLog("error", "evaluate (\(reason)): join failed or unverified (result=\(result.rawValue))")
+            writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
+                              ssidCurrent: ssidNow, lastJoinResult: result.rawValue)
+            if config.notify && !offlineEpisodeNotified {
+                offlineEpisodeNotified = true
+                postOfflineNotification(ssid: config.ssid, result: result, locationAuthorized: locationAuthorized)
+            }
+        }
+    }
+}
+
 // MARK: - AppDelegate
 
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -81,6 +307,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var rowInterval: NSMenuItem!
     var rowCooldown: NSMenuItem!
     var rowAgent: NSMenuItem!
+    var rowWatcher: NSMenuItem!
+    var rowLocation: NSMenuItem!
+    var rowRouter: NSMenuItem!
+    var rowLastJoin: NSMenuItem!
     var rowLog: NSMenuItem!
     var rowConfig: NSMenuItem!
 
@@ -92,6 +322,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+
+        // First thing the process does: run the join-engine gate (item 3's
+        // Location + CoreWLAN probe). See menubar/Wifi.swift.
+        WifiEngine.shared.runStartupGate()
+
+        // Start the event-driven watcher (item 4): NWPathMonitor, sleep/wake,
+        // the safety-net timer, and the trigger-file watch all funnel onto
+        // one serial queue from here on. See the Watcher class above.
+        Watcher.shared.start()
 
         buildStatusItem()
 
@@ -168,6 +407,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         subheadItem = captionRow("")
         menu.addItem(subheadItem)
 
+        // First of two root separators: status block above, controls below.
         menu.addItem(NSMenuItem.separator())
 
         toggleItem = NSMenuItem(title: "Auto-Join Hotspot", action: #selector(toggleAutoJoin), keyEquivalent: "")
@@ -177,8 +417,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         targetItem = captionRow("")
         menu.addItem(targetItem)
 
-        menu.addItem(NSMenuItem.separator())
-
         checkNowItem = NSMenuItem(title: "Check Now", action: #selector(checkNow), keyEquivalent: "r")
         checkNowItem.target = self
         menu.addItem(checkNowItem)
@@ -186,8 +424,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let logsItem = NSMenuItem(title: "Open Log", action: #selector(openLogs), keyEquivalent: "l")
         logsItem.target = self
         menu.addItem(logsItem)
-
-        menu.addItem(NSMenuItem.separator())
 
         // Settings submenu: every field hotspotd reports, actually displayed.
         let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
@@ -202,24 +438,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rowCooldown.isEnabled = false
         rowAgent     = NSMenuItem(title: "Background agent", action: nil, keyEquivalent: "")
         rowAgent.isEnabled = false
-        rowLog       = NSMenuItem(title: "Log", action: nil, keyEquivalent: "")
-        rowLog.isEnabled = false
+        rowWatcher   = NSMenuItem(title: "Watcher", action: nil, keyEquivalent: "")
+        rowWatcher.isEnabled = false
+        // Clickable when Location Services hasn't granted us access: opens
+        // the Privacy pane straight to the Location Services list.
+        rowLocation  = NSMenuItem(title: "Location access", action: #selector(openLocationPrefs), keyEquivalent: "")
+        rowLocation.target = self
+        rowLocation.isEnabled = false
+        rowRouter    = NSMenuItem(title: "Hotspot router", action: nil, keyEquivalent: "")
+        rowRouter.isEnabled = false
+        rowLastJoin  = NSMenuItem(title: "Last join", action: nil, keyEquivalent: "")
+        rowLastJoin.isEnabled = false
+        // The path row doubles as the "reveal in Finder" affordance — this is
+        // the only genuinely duplicated action, so the separate menu item is gone.
+        rowLog       = NSMenuItem(title: "Log", action: #selector(openLogFolder), keyEquivalent: "")
+        rowLog.target = self
         rowConfig    = NSMenuItem(title: "Config", action: nil, keyEquivalent: "")
         rowConfig.isEnabled = false
 
-        for r in [rowInterface, rowInterval, rowCooldown, rowAgent, rowLog, rowConfig] {
+        settingsMenu.addItem(NSMenuItem.sectionHeader(title: "Status"))
+        for r in [rowInterface, rowInterval, rowCooldown, rowAgent, rowWatcher, rowLocation, rowRouter, rowLastJoin] {
             settingsMenu.addItem(r!)
         }
 
-        settingsMenu.addItem(NSMenuItem.separator())
+        settingsMenu.addItem(NSMenuItem.sectionHeader(title: "Paths"))
+        for r in [rowLog, rowConfig] {
+            settingsMenu.addItem(r!)
+        }
+
+        settingsMenu.addItem(NSMenuItem.sectionHeader(title: "Actions"))
 
         let editConfig = NSMenuItem(title: "Edit Config…", action: #selector(editConfig), keyEquivalent: "")
         editConfig.target = self
         settingsMenu.addItem(editConfig)
-
-        let revealLog = NSMenuItem(title: "Reveal Log in Finder", action: #selector(revealLog), keyEquivalent: "")
-        revealLog.target = self
-        settingsMenu.addItem(revealLog)
 
         let reinstallItem = NSMenuItem(title: "Reinstall Agent", action: #selector(reinstallAgent), keyEquivalent: "")
         reinstallItem.target = self
@@ -228,6 +479,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settingsItem.submenu = settingsMenu
         menu.addItem(settingsItem)
 
+        // Second of two root separators: settings above, quit below.
         menu.addItem(NSMenuItem.separator())
 
         let quitItem = NSMenuItem(title: "Quit Auto Hotspot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -238,20 +490,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// personalhotspot is Apple's own Personal Hotspot glyph — it reads as "hotspot",
-    /// where the old wifi/wifi.slash pair read as "your Wi-Fi is broken".
+    /// where the old Wi-Fi glyph pair read as "your Wi-Fi is broken". The off
+    /// state is carried entirely by the .slash variant; `appearsDisabled` used to
+    /// also grey out the button, which read as "this whole item is inert" rather
+    /// than "auto-join is off".
     func setIcon(enabled: Bool, ok: Bool) {
         guard let button = statusItem.button else { return }
         let name = (ok && enabled) ? "personalhotspot" : "personalhotspot.slash"
-        if let image = NSImage(systemSymbolName: name, accessibilityDescription: "Auto Hotspot") {
+        let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
+        if let image = NSImage(systemSymbolName: name, accessibilityDescription: "Auto Hotspot")?
+            .withSymbolConfiguration(config) {
             image.isTemplate = true
-            image.size = NSSize(width: 17, height: 17)
             button.image = image
             button.title = ""
         } else {
             button.image = nil
             button.title = enabled ? "AH" : "ah"
         }
-        button.appearsDisabled = !(ok && enabled)
         button.toolTip = ok
             ? (enabled ? "Auto-join hotspot: on" : "Auto-join hotspot: off")
             : "hotspotd unavailable"
@@ -289,6 +544,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var enabled: Bool = false
         var agentInstalled: Bool = false
         var agentLoaded: Bool = false
+        var watcherRunning: Bool = false
+        var locationAuthorized: Bool = false
         var online: Bool = false
         var ssid: String = ""
         var ssidCurrent: String = ""
@@ -296,6 +553,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var wifiPower: String = "Off"
         var checkInterval: Int = 0
         var cooldown: Int = 0
+        var hotspotRouter: String = ""  // config key HOTSPOT_ROUTER; the "hotspot_router" JSON field
+        var lastJoinResult: String = ""
         var logPath: String = ""
         var configPath: String = ""
         var ok: Bool = false
@@ -313,6 +572,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         result.enabled = (obj["enabled"] as? Bool) ?? false
         result.agentInstalled = (obj["agent_installed"] as? Bool) ?? false
         result.agentLoaded = (obj["agent_loaded"] as? Bool) ?? false
+        result.watcherRunning = (obj["watcher_running"] as? Bool) ?? false
+        result.locationAuthorized = (obj["location_authorized"] as? Bool) ?? false
         result.online = (obj["online"] as? Bool) ?? false
         result.ssid = (obj["ssid"] as? String) ?? ""
         result.ssidCurrent = (obj["ssid_current"] as? String) ?? ""
@@ -320,6 +581,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         result.wifiPower = (obj["wifi_power"] as? String) ?? "Off"
         result.checkInterval = (obj["check_interval"] as? Int) ?? 0
         result.cooldown = (obj["cooldown"] as? Int) ?? 0
+        result.hotspotRouter = (obj["hotspot_router"] as? String) ?? ""
+        result.lastJoinResult = (obj["last_join_result"] as? String) ?? ""
         result.logPath = (obj["log_path"] as? String) ?? ""
         result.configPath = (obj["config_path"] as? String) ?? ""
         result.ok = true
@@ -352,7 +615,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             setSettingRow(rowInterval, "Check every", "—")
             setSettingRow(rowCooldown, "Retry cooldown", "—")
             setSettingRow(rowAgent, "Background agent", "unknown")
+            rowAgent.badge = nil
+            setSettingRow(rowWatcher, "Watcher", "—")
+            setSettingRow(rowLocation, "Location access", "—")
+            rowLocation.isEnabled = false
+            setSettingRow(rowRouter, "Hotspot router", "—")
+            setSettingRow(rowLastJoin, "Last join", "—")
             setSettingRow(rowLog, "Log", "—")
+            rowLog.isEnabled = false
             setSettingRow(rowConfig, "Config", "—")
             return
         }
@@ -385,7 +655,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setSettingRow(rowCooldown, "Retry cooldown", humanDuration(s.cooldown))
         setSettingRow(rowAgent, "Background agent",
                       s.agentLoaded ? "running" : (s.agentInstalled ? "installed, stopped" : "not installed"))
+        // The watcher is the event-driven core from item 4; flag it the moment
+        // it isn't running, since a loaded-but-watcherless agent silently falls
+        // back to the degraded polling-only worker.
+        rowAgent.badge = s.watcherRunning ? nil : NSMenuItemBadge(string: "!")
+
+        setSettingRow(rowWatcher, "Watcher", s.watcherRunning ? "running" : "stopped")
+
+        setSettingRow(rowLocation, "Location access",
+                      s.locationAuthorized ? "granted" : "not granted \u{2014} click to fix")
+        rowLocation.isEnabled = !s.locationAuthorized
+
+        setSettingRow(rowRouter, "Hotspot router", s.hotspotRouter.isEmpty ? "—" : s.hotspotRouter)
+        setSettingRow(rowLastJoin, "Last join", s.lastJoinResult.isEmpty ? "—" : s.lastJoinResult)
+
         setSettingRow(rowLog, "Log", abbreviateHome(s.logPath))
+        rowLog.isEnabled = true
         setSettingRow(rowConfig, "Config", abbreviateHome(s.configPath))
     }
 
@@ -430,11 +715,21 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc func revealLog() {
+    /// The Settings "Log" row's own action — reveals the log in Finder. This
+    /// replaces the old standalone "Reveal Log in Finder" item, which was a
+    /// duplicate affordance for the same path already shown right above it.
+    @objc func openLogFolder() {
         let path = last.logPath.isEmpty
             ? NSHomeDirectory() + "/Library/Logs/auto-hotspot.log"
             : last.logPath
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+    }
+
+    /// The Settings "Location access" row's action when access hasn't been
+    /// granted — jumps straight to the Privacy > Location Services pane.
+    @objc func openLocationPrefs() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @objc func editConfig() {
@@ -460,7 +755,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
+// Compiling AutoHotspot.swift alongside Wifi.swift means neither file is
+// named main.swift, so top-level statements aren't allowed here — @main
+// is the multi-file-safe equivalent. Still app.run(), not NSApplicationMain
+// (no nib; the delegate is assigned by hand).
+@main
+struct AutoHotspotMain {
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.run()
+    }
+}

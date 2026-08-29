@@ -15,10 +15,14 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>13.0</string>
+	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Auto Hotspot needs Location access because macOS requires it before any app can read Wi-Fi network names or join a network.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Auto Hotspot needs Location access because macOS requires it before any app can read Wi-Fi network names or join a network.</string>
 </dict>
 </plist>

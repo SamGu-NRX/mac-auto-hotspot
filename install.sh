@@ -21,10 +21,23 @@ DOMAIN="gui/$(id -u)"
 TEMPLATE="$ROOT/share/com.andrewwang.autohotspot.plist.template"
 CHECKER="$ROOT/libexec/auto-hotspot-check.sh"
 
+# Backstop LaunchAgent: runs $CHECKER on a fixed interval so reconnection
+# still happens if the AutoHotspot.app watcher is down or crash-looping.
+# See share/com.andrewwang.autohotspot.checker.plist.template.
+CHECKER_LABEL="com.andrewwang.autohotspot.checker"
+CHECKER_PLIST="$HOME/Library/LaunchAgents/$CHECKER_LABEL.plist"
+CHECKER_TEMPLATE="$ROOT/share/com.andrewwang.autohotspot.checker.plist.template"
+
+# The app bundle is the agent now; it lives at a fixed path outside this
+# checkout so TCC identity (Location Services grant) survives rebuilds.
+APP_PATH="$HOME/Applications/AutoHotspot.app"
+AGENT_EXEC="$APP_PATH/Contents/MacOS/AutoHotspot"
+
 SSID_OVERRIDE=""
-INTERVAL=120
-COOLDOWN=300
+CHECK_INTERVAL=300
+COOLDOWN=30
 IFACE="en0"
+HOTSPOT_ROUTER="172.20.10.1"
 NO_LOAD=0
 DRY_RUN=0
 
@@ -35,10 +48,11 @@ Usage: install.sh [options]
 Installs the auto-hotspot LaunchAgent for the current user (must not run as root).
 
 Options:
-  --ssid NAME          Hotspot SSID to join when offline (default: Andrew's iPhone)
-  --interval SECONDS   How often to check reachability (default: 120)
-  --cooldown SECONDS   Minimum seconds between join attempts (default: 300)
+  --ssid NAME          Hotspot SSID to join when offline (default: Andrew’s iPhone)
+  --interval SECONDS   Safety-net poll interval, read at runtime by the agent (default: 300)
+  --cooldown SECONDS   Minimum seconds between join attempts (default: 30)
   --interface NAME     Wi-Fi interface to manage (default: en0)
+  --router IP          iOS tethering gateway used to verify a join (default: 172.20.10.1)
   --no-load            Render config/plist but skip launchctl bootstrap
   --dry-run            Print exactly what would happen; touch nothing
   -h, --help           Show this help
@@ -58,7 +72,7 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --interval)
-      INTERVAL="${2:-}"
+      CHECK_INTERVAL="${2:-}"
       shift 2
       ;;
     --cooldown)
@@ -67,6 +81,10 @@ while [ $# -gt 0 ]; do
       ;;
     --interface)
       IFACE="${2:-}"
+      shift 2
+      ;;
+    --router)
+      HOTSPOT_ROUTER="${2:-}"
       shift 2
       ;;
     --no-load)
@@ -89,6 +107,25 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+is_positive_int() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    0) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+if ! is_positive_int "$CHECK_INTERVAL"; then
+  echo "error: --interval must be a positive integer (got: $CHECK_INTERVAL)" >&2
+  usage >&2
+  exit 1
+fi
+if ! is_positive_int "$COOLDOWN"; then
+  echo "error: --cooldown must be a positive integer (got: $COOLDOWN)" >&2
+  usage >&2
+  exit 1
+fi
+
 run() {
   if [ "$DRY_RUN" -eq 1 ]; then
     printf 'would run:'
@@ -106,6 +143,10 @@ if [ ! -f "$TEMPLATE" ]; then
 fi
 if [ ! -f "$CHECKER" ]; then
   echo "error: missing checker script: $CHECKER" >&2
+  exit 1
+fi
+if [ ! -f "$CHECKER_TEMPLATE" ]; then
+  echo "error: missing checker plist template: $CHECKER_TEMPLATE" >&2
   exit 1
 fi
 
@@ -127,10 +168,12 @@ else
     {
       echo "# auto-hotspot configuration"
       printf 'SSID="Andrew\342\200\231s iPhone"\n'
-      echo "CHECK_INTERVAL=120"
-      echo "COOLDOWN=300"
+      echo "CHECK_INTERVAL=300"
+      echo "COOLDOWN=30"
       echo "ENABLED=1"
       echo "WIFI_INTERFACE=\"en0\""
+      echo "HOTSPOT_ROUTER=\"172.20.10.1\""
+      echo "NOTIFY=1"
     } > "$CONFIG"
     echo "created $CONFIG"
   else
@@ -161,20 +204,38 @@ set_config_key "HOTSPOTD_BIN" "HOTSPOTD_BIN=\"$ROOT/bin/hotspotd\""
 if [ -n "$SSID_OVERRIDE" ]; then
   set_config_key "SSID" "SSID=\"$SSID_OVERRIDE\""
 fi
-set_config_key "CHECK_INTERVAL" "CHECK_INTERVAL=$INTERVAL"
+set_config_key "CHECK_INTERVAL" "CHECK_INTERVAL=$CHECK_INTERVAL"
 set_config_key "COOLDOWN" "COOLDOWN=$COOLDOWN"
 set_config_key "WIFI_INTERFACE" "WIFI_INTERFACE=\"$IFACE\""
+set_config_key "HOTSPOT_ROUTER" "HOTSPOT_ROUTER=\"$HOTSPOT_ROUTER\""
+
+echo "==> Building and installing the menu bar app (agent)"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "would run: $ROOT/bin/hotspotd menubar --rebuild --build-only"
+else
+  if ! "$ROOT/bin/hotspotd" menubar --rebuild --build-only; then
+    echo "error: failed to build/sign/install AutoHotspot.app" >&2
+    exit 1
+  fi
+  if [ ! -x "$AGENT_EXEC" ]; then
+    echo "error: $AGENT_EXEC is missing after build; the agent cannot be installed" >&2
+    exit 1
+  fi
+  echo "installed $APP_PATH"
+fi
 
 echo "==> Rendering LaunchAgent plist"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "would render $TEMPLATE -> $PLIST"
 else
+  # Delimiter is a control character (SOH, \001), not `|` — a path
+  # containing `|` (unlikely but not impossible) would otherwise produce a
+  # malformed sed expression instead of a clean substitution.
   sed \
-    -e 's|__LABEL__|'"$LABEL"'|g' \
-    -e 's|__CHECKER_PATH__|'"$CHECKER"'|g' \
-    -e 's|__CHECK_INTERVAL__|'"$INTERVAL"'|g' \
-    -e 's|__LOG_PATH__|'"$HOME/Library/Logs/auto-hotspot.launchd.out"'|g' \
-    -e 's|__ERR_LOG_PATH__|'"$HOME/Library/Logs/auto-hotspot.launchd.err"'|g' \
+    -e $'s\001__LABEL__\001'"$LABEL"$'\001g' \
+    -e $'s\001__APP_BUNDLE_PATH__\001'"$APP_PATH"$'\001g' \
+    -e $'s\001__LOG_PATH__\001'"$HOME/Library/Logs/auto-hotspot.launchd.out"$'\001g' \
+    -e $'s\001__ERR_LOG_PATH__\001'"$HOME/Library/Logs/auto-hotspot.launchd.err"$'\001g' \
     "$TEMPLATE" > "$PLIST.tmp"
 
   if ! plutil -lint "$PLIST.tmp" >/dev/null; then
@@ -183,9 +244,42 @@ else
     exit 1
   fi
 
+  if [ -f "$PLIST" ]; then
+    cp -p "$PLIST" "$PLIST.bak"
+    echo "backed up existing plist to $PLIST.bak"
+  fi
+
   mv -f "$PLIST.tmp" "$PLIST"
   chmod 644 "$PLIST"
   echo "wrote $PLIST"
+fi
+
+echo "==> Rendering backstop checker LaunchAgent plist"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "would render $CHECKER_TEMPLATE -> $CHECKER_PLIST"
+else
+  sed \
+    -e $'s\001__CHECKER_LABEL__\001'"$CHECKER_LABEL"$'\001g' \
+    -e $'s\001__CHECKER_PATH__\001'"$CHECKER"$'\001g' \
+    -e $'s\001__CHECK_INTERVAL__\001'"$CHECK_INTERVAL"$'\001g' \
+    -e $'s\001__CHECKER_LOG_PATH__\001'"$HOME/Library/Logs/auto-hotspot.checker.launchd.out"$'\001g' \
+    -e $'s\001__CHECKER_ERR_LOG_PATH__\001'"$HOME/Library/Logs/auto-hotspot.checker.launchd.err"$'\001g' \
+    "$CHECKER_TEMPLATE" > "$CHECKER_PLIST.tmp"
+
+  if ! plutil -lint "$CHECKER_PLIST.tmp" >/dev/null; then
+    echo "error: rendered checker plist failed plutil -lint" >&2
+    rm -f "$CHECKER_PLIST.tmp"
+    exit 1
+  fi
+
+  if [ -f "$CHECKER_PLIST" ]; then
+    cp -p "$CHECKER_PLIST" "$CHECKER_PLIST.bak"
+    echo "backed up existing checker plist to $CHECKER_PLIST.bak"
+  fi
+
+  mv -f "$CHECKER_PLIST.tmp" "$CHECKER_PLIST"
+  chmod 644 "$CHECKER_PLIST"
+  echo "wrote $CHECKER_PLIST"
 fi
 
 if [ "$NO_LOAD" -eq 1 ]; then
@@ -210,6 +304,26 @@ else
       exit 1
     fi
   fi
+
+  echo "==> Loading backstop checker LaunchAgent"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "would run: launchctl bootout \"$DOMAIN/$CHECKER_LABEL\""
+    echo "would run: launchctl enable \"$DOMAIN/$CHECKER_LABEL\""
+    echo "would run: launchctl bootstrap \"$DOMAIN\" \"$CHECKER_PLIST\""
+  else
+    launchctl bootout "$DOMAIN/$CHECKER_LABEL" 2>/dev/null || true
+    launchctl enable "$DOMAIN/$CHECKER_LABEL"
+    if launchctl bootstrap "$DOMAIN" "$CHECKER_PLIST"; then
+      if launchctl print "$DOMAIN/$CHECKER_LABEL" >/dev/null 2>&1; then
+        echo "loaded: $CHECKER_LABEL is running under $DOMAIN"
+      else
+        echo "warning: bootstrap succeeded but launchctl print could not find $CHECKER_LABEL" >&2
+      fi
+    else
+      echo "error: launchctl bootstrap failed for $CHECKER_LABEL" >&2
+      exit 1
+    fi
+  fi
 fi
 
 echo "==> Linking hotspotd onto PATH"
@@ -226,7 +340,12 @@ for d in "$HOME/.local/bin" /opt/homebrew/bin /usr/local/bin; do
 done
 
 if [ -z "$LINK_DIR" ]; then
-  if mkdir -p "$HOME/.local/bin" 2>/dev/null && [ -w "$HOME/.local/bin" ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    # Don't touch $HOME/.local/bin at all under --dry-run, even to check
+    # writability — report what a real run would most likely do instead.
+    echo "would create $HOME/.local/bin (if needed) and link hotspotd into it"
+    LINK_DIR="$HOME/.local/bin"
+  elif mkdir -p "$HOME/.local/bin" 2>/dev/null && [ -w "$HOME/.local/bin" ]; then
     LINK_DIR="$HOME/.local/bin"
     echo "note: $LINK_DIR is not on your PATH yet. Add this to your shell profile:"
     echo "      export PATH=\"\$HOME/.local/bin:\$PATH\""
@@ -234,7 +353,9 @@ if [ -z "$LINK_DIR" ]; then
 fi
 
 if [ -n "$LINK_DIR" ]; then
-  if ln -sfn "$ROOT/bin/hotspotd" "$LINK_DIR/hotspotd" 2>/dev/null; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "would link $LINK_DIR/hotspotd -> $ROOT/bin/hotspotd"
+  elif ln -sfn "$ROOT/bin/hotspotd" "$LINK_DIR/hotspotd" 2>/dev/null; then
     echo "linked $LINK_DIR/hotspotd -> $ROOT/bin/hotspotd"
   else
     echo "warning: could not link into $LINK_DIR; call $ROOT/bin/hotspotd directly" >&2
@@ -249,7 +370,7 @@ Next steps (open a new shell first, or run: hash -r)
   hotspotd status   check current state
   hotspotd logs     tail the log
   hotspotd off      pause auto-hotspot
-  hotspotd menubar  build + launch the menu bar toggle app
+  hotspotd menubar  launch the menu bar toggle app (already installed above)
 
 Note: RunAtLoad means a reachability check just ran.
 EOF

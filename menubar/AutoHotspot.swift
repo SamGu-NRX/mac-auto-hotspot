@@ -48,10 +48,12 @@ func locateHotspotd() -> String {
 
 // MARK: - Menu bar glyphs
 //
-// The user has not picked a final glyph yet (see tools/icon-contact-sheet.swift).
-// Kept as two constants so swapping in their pick is a one-line change.
-let iconOnSymbol = "personalhotspot"
-let iconOffSymbol = "personalhotspot.slash"
+// antenna.radiowaves.left.and.right / .slash, not personalhotspot: it's the only
+// strong candidate with a real Apple-drawn .slash variant, so the OFF state stays
+// crisp instead of getting a hand-drawn diagonal through it. Not wifi/wifi.slash
+// either — that pair reads as "your Wi-Fi is broken" rather than "auto-join is off".
+let iconOnSymbol = "antenna.radiowaves.left.and.right"
+let iconOffSymbol = "antenna.radiowaves.left.and.right.slash"
 
 // MARK: - Watcher
 //

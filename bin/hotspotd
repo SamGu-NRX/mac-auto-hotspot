@@ -152,8 +152,16 @@ agent_status_field() {
 }
 
 current_ssid() {
-  ssid="$(networksetup -getairportnetwork "$WIFI_INTERFACE" 2>/dev/null | sed -n 's/^Current Wi-Fi Network: //p')"
-  if [ -z "$ssid" ]; then
+  # Try the agent's own status file first: it holds the only TCC grant that
+  # can actually see SSIDs on macOS 26 (see libexec/auto-hotspot-check.sh's
+  # matching current_ssid for the same fallback chain). networksetup/ipconfig
+  # report "<redacted>" while genuinely associated on this OS, so that value
+  # must fall through to the next source, not be treated as a real SSID.
+  ssid="$(agent_status_field ssid_current string "")"
+  if [ -z "$ssid" ] || [ "$ssid" = "<redacted>" ]; then
+    ssid="$(networksetup -getairportnetwork "$WIFI_INTERFACE" 2>/dev/null | sed -n 's/^Current Wi-Fi Network: //p')"
+  fi
+  if [ -z "$ssid" ] || [ "$ssid" = "<redacted>" ]; then
     ssid="$(ipconfig getsummary "$WIFI_INTERFACE" 2>/dev/null | sed -n 's/.*SSID : \(.*\)/\1/p' | head -1)"
   fi
   printf '%s' "$ssid"

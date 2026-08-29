@@ -192,10 +192,10 @@ target SSID, Check Now, in-app config editing — was cut. `hotspotd doctor` and
 `hotspotd status --json` are the diagnostic surface now; see `docs/decisions/0002-minimal-menu.md`
 for why.
 
-The status item icon is currently the `personalhotspot` SF Symbol (slashed when auto-join is
-paused) — a placeholder. `tools/icon-contact-sheet.swift` renders a contact sheet of candidate
-glyphs (stock SF Symbols and custom-drawn marks, on/off states, light/dark) to `build/`; no final
-choice has been made yet.
+The status item icon is `antenna.radiowaves.left.and.right` (slashed when auto-join is paused) —
+chosen over `personalhotspot` and over `wifi`/`wifi.slash` (which reads as "your Wi-Fi is broken"
+rather than "auto-join is off"). `iconOnSymbol`/`iconOffSymbol` at the top of `AutoHotspot.swift`
+are the single point of change if the glyph ever needs to change again.
 
 To have it start at login, add `~/Applications/AutoHotspot.app` to Login Items yourself; the
 installer doesn't do this for you.

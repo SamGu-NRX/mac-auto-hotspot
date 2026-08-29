@@ -69,7 +69,7 @@ bin/hotspotd status --json
 AUTO_HOTSPOT_FORCE=1 libexec/auto-hotspot-check.sh
 bin/hotspotd agent load   # (re)bootstrap the launchd agent without rebuilding or re-signing it
 bash -n <script>          # syntax-check every shell file before committing
-swiftc -O -o build/AutoHotspot menubar/AutoHotspot.swift menubar/Wifi.swift
+swiftc -O -o build/AutoHotspot.app/Contents/MacOS/AutoHotspot menubar/AutoHotspot.swift menubar/Wifi.swift
 plutil -lint <rendered-plist>
 ```
 
@@ -105,6 +105,14 @@ Env overrides for testing without touching the real install: `AUTO_HOTSPOT_CONFI
   macOS 26's `scutil` dropped `n.wait`. Never build a shell-based network watcher on `scutil` —
   it can't block-and-wait for a *future* transition the way this needs; that's a real reason (not
   just a style preference) the watcher lives in `NWPathMonitor` inside the Swift process instead.
+- Never write `producer | grep -q pattern` in these scripts. `grep -q` exits as soon as it sees a
+  match and SIGPIPEs the producer; under `set -o pipefail` the pipeline then reports 141, and a
+  test on that exit code inverts — it reads as "no match" exactly when there was one. Capture the
+  producer's output into a variable first, then match it with a `case` statement. Two such bugs
+  have already been fixed in this repo; don't reintroduce the pattern.
+- BSD `sed`'s basic regular expressions have no `\|` alternation — that's a GNU extension. A BRE
+  like `\(true\|false\)` silently matches nothing on macOS. Use `sed -E` (or `-r`) and an
+  unescaped `(true|false)` whenever a pattern needs alternation.
 
 ## Commits
 
@@ -112,16 +120,26 @@ Conventional Commits (`feat`, `fix`, `docs`, `chore`, …), imperative mood, low
 
 ## Menu bar app conventions
 
-- `NSMenu.autoenablesItems` must stay `false` on both the root menu and the Settings submenu.
-  AppKit's auto-validation overrides any manual `isEnabled`, which silently breaks caption rows
-  and the busy state during `Check Now`.
-- Caption and settings rows are rendered with an explicit `attributedTitle` (secondary colour,
-  small system font) rather than relying on the disabled-item appearance, which renders washed out.
-- The status item icon uses `personalhotspot` / `personalhotspot.slash` — a placeholder pending
-  the pick from the icon contact sheet (`tools/icon-contact-sheet.swift`, see `build/`). `wifi` /
-  `wifi.slash` was tried and rejected: that pair reads as "your Wi-Fi is broken" rather than
-  "auto-join is off". `iconOnSymbol` / `iconOffSymbol` at the top of `AutoHotspot.swift` are the
-  single point of change once a final glyph is chosen.
+- `NSMenu.autoenablesItems` must stay `false` on the root menu — there is no Settings submenu
+  anymore; the menu is one flat list. AppKit's auto-validation overrides any manual `isEnabled`,
+  which silently broke the status-line caption before this was set.
+- The status line is rendered with an explicit `attributedTitle` (a coloured dot plus secondary
+  system-font text) rather than relying on the disabled-item appearance, which renders washed out.
+- The root menu is rebuilt by `rebuildMenu()`: status line, zero or more **problem rows** (Grant
+  Location Access…, Turn Wi-Fi On, Restart Background Agent, Last Join Failed…), separator, the
+  Auto-Join Hotspot toggle, separator, Quit. Each problem row is appended only while its condition
+  holds — `removeAllItems()` + rebuild from scratch every time, not a pre-built row that's merely
+  hidden. There's no Check Now button and no in-app config editing; `hotspotd doctor` and
+  `hotspotd status --json` are the diagnostic surface instead.
+- `rebuildMenu()` only runs from a live status update while the menu is closed (`!menuIsOpen`) —
+  `menuWillOpen` already rebuilds synchronously the instant the menu opens. Adding or removing a
+  problem row while the user has the menu open would make a row appear or vanish under the cursor.
+- The status item icon uses `antenna.radiowaves.left.and.right` / `.slash`: the only
+  strong candidate with a real Apple-drawn `.slash` variant, so the OFF state stays
+  crisp instead of getting a hand-drawn diagonal. Do not go back to `wifi` /
+  `wifi.slash` — that pair reads as "your Wi-Fi is broken" rather than "auto-join is
+  off". `iconOnSymbol` / `iconOffSymbol` at the top of `AutoHotspot.swift` are the
+  single point of change if the glyph ever needs to change again.
 - Entry point is `app.run()`, not `NSApplicationMain`, since there is no nib and the delegate is
   assigned by hand.
 - The root menu is a status line, problem rows, the Auto-Join Hotspot toggle, and Quit — nothing

@@ -420,6 +420,44 @@ cmd_menubar() {
   fi
 }
 
+cmd_agent() {
+  sub="${1:-}"
+  case "$sub" in
+    load)
+      # (Re-)bootstraps the existing plist with launchctl only. Never
+      # compiles, signs, or ditto's anything, so the ad-hoc cdhash (and the
+      # Location Services grant keyed to it) is left untouched.
+      launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+      bootout_rc=$?
+      # bootout exits 3 when nothing was loaded; that's not a failure.
+      if [ $bootout_rc -ne 0 ] && [ $bootout_rc -ne 3 ]; then
+        err "agent load: warning: bootout exited $bootout_rc (continuing)"
+      fi
+
+      launchctl enable "gui/$(id -u)/$LABEL" 2>/dev/null
+
+      out="$(launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>&1)"
+      rc=$?
+      # bootstrap exits 37 (EALREADY) when the job is already loaded; that's
+      # success, not failure.
+      if [ $rc -eq 0 ] || [ $rc -eq 37 ]; then
+        echo "hotspotd: agent load: $LABEL is loaded"
+        return 0
+      fi
+      err "agent load: bootstrap failed: $out"
+      return 1
+      ;;
+    "")
+      err "agent: missing subcommand (expected: load)"
+      return 1
+      ;;
+    *)
+      err "agent: unknown subcommand '$sub' (expected: load)"
+      return 1
+      ;;
+  esac
+}
+
 cmd_doctor() {
   load_config
   finding() {
@@ -527,6 +565,7 @@ subcommands:
   install         install the launchd agent (delegates to install.sh)
   uninstall       remove the launchd agent (delegates to uninstall.sh)
   menubar         launch the installed menu bar app (menubar --rebuild to build, sign, and reinstall it)
+  agent load    (re)bootstrap the launchd agent without rebuilding or re-signing it
   help            show this help
   version         print the version
 
@@ -554,6 +593,7 @@ main() {
     install) cmd_install "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
     menubar) cmd_menubar "$@" ;;
+    agent) cmd_agent "$@" ;;
     help|-h|--help|-\?) cmd_help "$@" ;;
     version) cmd_version "$@" ;;
     *)

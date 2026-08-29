@@ -473,10 +473,29 @@ final class WifiEngine {
         return ssids
     }
 
+    /// Loose-matches SSIDs across the U+2019/U+2018/U+02BC-vs-ASCII-apostrophe
+    /// footgun: lowercases and folds all three quote-like code points to a
+    /// plain `'`. Used only for near-miss *detection* in logging — never for
+    /// the actual join decision, which stays an exact string match.
+    private func looseSSIDKey(_ ssid: String) -> String {
+        var folded = ssid.lowercased()
+        for quote in ["\u{2019}", "\u{2018}", "\u{02BC}"] {
+            folded = folded.replacingOccurrences(of: quote, with: "'")
+        }
+        return folded
+    }
+
     /// Targeted scan for one SSID; on an empty result, falls back to a full
     /// sweep filtered by name. This is the only code path in the repo that
     /// can see SSIDs on macOS 26 (requires Location authorization).
-    func scanFor(ssid: String) -> [CWNetwork] {
+    ///
+    /// `verbose` controls whether a full sweep's diagnostics are written to
+    /// the log: `join(ssid:forceRejoin:)` passes `true` so a failed join is
+    /// self-explanatory from the log alone, while the startup gate's own
+    /// scan (which doesn't call this at all) and any other routine polling
+    /// stay count-only so the user's network neighbourhood isn't written to
+    /// disk on every background cycle.
+    func scanFor(ssid: String, verbose: Bool = false) -> [CWNetwork] {
         guard let interface = CWWiFiClient.shared().interface() else {
             wifiLog("error", "scanFor(\(ssid)): no CWInterface")
             return []
@@ -497,6 +516,42 @@ final class WifiEngine {
             let all = try interface.scanForNetworks(withSSID: nil)
             let matches = all.filter { $0.ssid == ssid }
             wifiLog("info", "scanFor(\(ssid)): sweep found \(all.count) total, \(matches.count) matching")
+
+            if verbose {
+                let seen = all.compactMap { $0.ssid }.filter { !$0.isEmpty }
+                let deduped = Array(Set(seen)).sorted()
+                let joined = deduped.joined(separator: ", ")
+                if joined.count > 1200 {
+                    // Truncate at a whole-item boundary so the "+K more"
+                    // count is exact, rather than cutting mid-SSID.
+                    var kept: [String] = []
+                    var length = 0
+                    for item in deduped {
+                        let addedLength = length == 0 ? item.count : length + 2 + item.count
+                        if addedLength > 1200 { break }
+                        kept.append(item)
+                        length = addedLength
+                    }
+                    let truncated = kept.joined(separator: ", ")
+                    let more = deduped.count - kept.count
+                    wifiLog("info", "scanFor(\(ssid)): sweep saw: \(truncated)…(+\(more) more)")
+                } else {
+                    wifiLog("info", "scanFor(\(ssid)): sweep saw: \(joined)")
+                }
+
+                let targetKey = looseSSIDKey(ssid)
+                for candidate in deduped where candidate != ssid {
+                    if looseSSIDKey(candidate) == targetKey {
+                        wifiLog("warn", "scanFor(\(ssid)): near-miss \"\(candidate)\" loose-matches target but is not an exact match (apostrophe/quote variant?)")
+                    }
+                }
+
+                if matches.isEmpty {
+                    let hex = ssid.utf8.map { String(format: "%02x", $0) }.joined(separator: " ")
+                    wifiLog("info", "scanFor(\(ssid)): target SSID UTF-8 bytes: \(hex)")
+                }
+            }
+
             return Array(matches)
         } catch {
             wifiLog("error", "scanFor(\(ssid)): sweep failed: \(error.localizedDescription)")
@@ -558,7 +613,7 @@ final class WifiEngine {
             return .alreadyJoined
         }
 
-        let candidates = scanFor(ssid: ssid)
+        let candidates = scanFor(ssid: ssid, verbose: true)
         guard let network = candidates.first else {
             wifiLog("warn", "join(\(ssid)): not found in scan")
             return .notFound

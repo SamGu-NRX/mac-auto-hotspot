@@ -46,24 +46,12 @@ func locateHotspotd() -> String {
     return fallback
 }
 
-// MARK: - Formatting helpers
-
-func humanDuration(_ seconds: Int) -> String {
-    if seconds <= 0 { return "—" }
-    if seconds < 60 { return "\(seconds)s" }
-    if seconds % 60 == 0 {
-        let m = seconds / 60
-        if m % 60 == 0 { return "\(m / 60)h" }
-        return "\(m)m"
-    }
-    return "\(seconds / 60)m \(seconds % 60)s"
-}
-
-func abbreviateHome(_ path: String) -> String {
-    let home = NSHomeDirectory()
-    if path.hasPrefix(home) { return "~" + String(path.dropFirst(home.count)) }
-    return path
-}
+// MARK: - Menu bar glyphs
+//
+// The user has not picked a final glyph yet (see tools/icon-contact-sheet.swift).
+// Kept as two constants so swapping in their pick is a one-line change.
+let iconOnSymbol = "personalhotspot"
+let iconOffSymbol = "personalhotspot.slash"
 
 // MARK: - Watcher
 //
@@ -291,32 +279,47 @@ final class Watcher {
 
 // MARK: - AppDelegate
 
+// MARK: - Problem rows
+//
+// A problem exists only while its condition is true; rebuildMenu() re-derives
+// this list from the cached Status every time the menu is rebuilt, so a row
+// physically does not exist in the menu when its condition is false rather
+// than being pre-built and hidden.
+enum Problem {
+    case locationDenied
+    case wifiOff
+    case agentDown
+    case lastJoinFailed
+}
+
+private let actionableJoinFailures: Set<String> = [
+    "not_found", "auth_failed", "verification_failed", "interface_error",
+]
+
+func problems(_ s: AppDelegate.Status) -> [Problem] {
+    var result: [Problem] = []
+    if !s.locationAuthorized { result.append(.locationDenied) }
+    if s.wifiPower != "On" { result.append(.wifiOff) }
+    if !s.agentLoaded || !s.watcherRunning { result.append(.agentDown) }
+    if !s.online && actionableJoinFailures.contains(s.lastJoinResult) { result.append(.lastJoinFailed) }
+    return result
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var statusItem: NSStatusItem!
     var menu: NSMenu!
 
     var headlineItem: NSMenuItem!
-    var subheadItem: NSMenuItem!
     var toggleItem: NSMenuItem!
-    var targetItem: NSMenuItem!
-    var checkNowItem: NSMenuItem!
-
-    var settingsMenu: NSMenu!
-    var rowInterface: NSMenuItem!
-    var rowInterval: NSMenuItem!
-    var rowCooldown: NSMenuItem!
-    var rowAgent: NSMenuItem!
-    var rowWatcher: NSMenuItem!
-    var rowLocation: NSMenuItem!
-    var rowRouter: NSMenuItem!
-    var rowLastJoin: NSMenuItem!
-    var rowLog: NSMenuItem!
-    var rowConfig: NSMenuItem!
 
     var refreshTimer: Timer?
     var last = Status()
     var busy = false
+    // Tracks whether the menu is currently open so applyStatus knows it may
+    // only update titles/state in place, never add or remove items, while
+    // the user has it open (rows must never appear/vanish under the cursor).
+    var menuIsOpen = false
 
     let hotspotdPath: String = locateHotspotd()
 
@@ -350,35 +353,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Menu construction
 
-    /// A non-interactive caption row. Built with an explicit attributedTitle so it renders
-    /// in the secondary style instead of AppKit's washed-out "disabled item" grey.
-    func captionRow(_ text: String) -> NSMenuItem {
-        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        setCaption(item, text)
-        return item
-    }
-
-    func setCaption(_ item: NSMenuItem, _ text: String) {
-        item.attributedTitle = NSAttributedString(string: text, attributes: [
-            .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ])
-    }
-
-    /// A "Label   value" settings row, value in secondary colour so the pair reads as one line.
-    func setSettingRow(_ item: NSMenuItem, _ label: String, _ value: String) {
-        let s = NSMutableAttributedString(
-            string: label + "  ",
-            attributes: [.font: NSFont.menuFont(ofSize: 0),
-                         .foregroundColor: NSColor.labelColor])
-        s.append(NSAttributedString(
-            string: value,
-            attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular),
-                         .foregroundColor: NSColor.secondaryLabelColor]))
-        item.attributedTitle = s
-    }
-
     func setHeadline(_ item: NSMenuItem, dot: NSColor, _ text: String) {
         let s = NSMutableAttributedString(
             string: "\u{25CF} ",
@@ -391,7 +365,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        setIcon(enabled: false, ok: false)
+        setIcon(enabled: false, ok: false, attention: false)
 
         menu = NSMenu()
         menu.delegate = self
@@ -402,104 +376,70 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         headlineItem = NSMenuItem(title: "Checking…", action: nil, keyEquivalent: "")
         headlineItem.isEnabled = false
         setHeadline(headlineItem, dot: .tertiaryLabelColor, "Checking…")
-        menu.addItem(headlineItem)
-
-        subheadItem = captionRow("")
-        menu.addItem(subheadItem)
-
-        // First of two root separators: status block above, controls below.
-        menu.addItem(NSMenuItem.separator())
 
         toggleItem = NSMenuItem(title: "Auto-Join Hotspot", action: #selector(toggleAutoJoin), keyEquivalent: "")
         toggleItem.target = self
+
+        rebuildMenu()
+        statusItem.menu = menu
+    }
+
+    /// Rebuilds the whole menu from `last`: removeAllItems() + addItem is
+    /// safe on macOS 14+ and is the only way a problem row can physically
+    /// not exist when its condition is false, rather than being pre-built
+    /// and hidden. Order: status line, zero or more problem rows, separator,
+    /// toggle, separator, Quit.
+    func rebuildMenu() {
+        menu.removeAllItems()
+
+        menu.addItem(headlineItem)
+
+        for problem in problems(last) {
+            menu.addItem(menuItem(for: problem))
+        }
+
+        menu.addItem(NSMenuItem.separator())
         menu.addItem(toggleItem)
-
-        targetItem = captionRow("")
-        menu.addItem(targetItem)
-
-        checkNowItem = NSMenuItem(title: "Check Now", action: #selector(checkNow), keyEquivalent: "r")
-        checkNowItem.target = self
-        menu.addItem(checkNowItem)
-
-        let logsItem = NSMenuItem(title: "Open Log", action: #selector(openLogs), keyEquivalent: "l")
-        logsItem.target = self
-        menu.addItem(logsItem)
-
-        // Settings submenu: every field hotspotd reports, actually displayed.
-        let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
-        settingsMenu = NSMenu()
-        settingsMenu.autoenablesItems = false
-
-        rowInterface = NSMenuItem(title: "Interface", action: nil, keyEquivalent: "")
-        rowInterface.isEnabled = false
-        rowInterval  = NSMenuItem(title: "Check every", action: nil, keyEquivalent: "")
-        rowInterval.isEnabled = false
-        rowCooldown  = NSMenuItem(title: "Retry cooldown", action: nil, keyEquivalent: "")
-        rowCooldown.isEnabled = false
-        rowAgent     = NSMenuItem(title: "Background agent", action: nil, keyEquivalent: "")
-        rowAgent.isEnabled = false
-        rowWatcher   = NSMenuItem(title: "Watcher", action: nil, keyEquivalent: "")
-        rowWatcher.isEnabled = false
-        // Clickable when Location Services hasn't granted us access: opens
-        // the Privacy pane straight to the Location Services list.
-        rowLocation  = NSMenuItem(title: "Location access", action: #selector(openLocationPrefs), keyEquivalent: "")
-        rowLocation.target = self
-        rowLocation.isEnabled = false
-        rowRouter    = NSMenuItem(title: "Hotspot router", action: nil, keyEquivalent: "")
-        rowRouter.isEnabled = false
-        rowLastJoin  = NSMenuItem(title: "Last join", action: nil, keyEquivalent: "")
-        rowLastJoin.isEnabled = false
-        // The path row doubles as the "reveal in Finder" affordance — this is
-        // the only genuinely duplicated action, so the separate menu item is gone.
-        rowLog       = NSMenuItem(title: "Log", action: #selector(openLogFolder), keyEquivalent: "")
-        rowLog.target = self
-        rowConfig    = NSMenuItem(title: "Config", action: nil, keyEquivalent: "")
-        rowConfig.isEnabled = false
-
-        settingsMenu.addItem(NSMenuItem.sectionHeader(title: "Status"))
-        for r in [rowInterface, rowInterval, rowCooldown, rowAgent, rowWatcher, rowLocation, rowRouter, rowLastJoin] {
-            settingsMenu.addItem(r!)
-        }
-
-        settingsMenu.addItem(NSMenuItem.sectionHeader(title: "Paths"))
-        for r in [rowLog, rowConfig] {
-            settingsMenu.addItem(r!)
-        }
-
-        settingsMenu.addItem(NSMenuItem.sectionHeader(title: "Actions"))
-
-        let editConfig = NSMenuItem(title: "Edit Config…", action: #selector(editConfig), keyEquivalent: "")
-        editConfig.target = self
-        settingsMenu.addItem(editConfig)
-
-        let reinstallItem = NSMenuItem(title: "Reinstall Agent", action: #selector(reinstallAgent), keyEquivalent: "")
-        reinstallItem.target = self
-        settingsMenu.addItem(reinstallItem)
-
-        settingsItem.submenu = settingsMenu
-        menu.addItem(settingsItem)
-
-        // Second of two root separators: settings above, quit below.
         menu.addItem(NSMenuItem.separator())
 
         let quitItem = NSMenuItem(title: "Quit Auto Hotspot", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quitItem.target = NSApp
         menu.addItem(quitItem)
+    }
 
-        statusItem.menu = menu
+    func menuItem(for problem: Problem) -> NSMenuItem {
+        let item: NSMenuItem
+        switch problem {
+        case .locationDenied:
+            item = NSMenuItem(title: "Grant Location Access…", action: #selector(openLocationPrefs), keyEquivalent: "")
+        case .wifiOff:
+            item = NSMenuItem(title: "Turn Wi-Fi On", action: #selector(turnWifiOn), keyEquivalent: "")
+        case .agentDown:
+            item = NSMenuItem(title: "Restart Background Agent", action: #selector(restartAgent), keyEquivalent: "")
+        case .lastJoinFailed:
+            item = NSMenuItem(title: "Last Join Failed (\(last.lastJoinResult)) — Open Log", action: #selector(openLogs), keyEquivalent: "")
+        }
+        item.target = self
+        item.isEnabled = true
+        return item
     }
 
     /// personalhotspot is Apple's own Personal Hotspot glyph — it reads as "hotspot",
     /// where the old Wi-Fi glyph pair read as "your Wi-Fi is broken". The off
     /// state is carried entirely by the .slash variant; `appearsDisabled` used to
     /// also grey out the button, which read as "this whole item is inert" rather
-    /// than "auto-join is off".
-    func setIcon(enabled: Bool, ok: Bool) {
+    /// than "auto-join is off". Online/offline is deliberately not encoded here —
+    /// it flips too often and macOS's own Wi-Fi menu already shows it. Instead
+    /// `attention` composites a small filled dot onto the symbol whenever a
+    /// problem row is showing (or hotspotd is unreachable), so the icon alone
+    /// tells the user "something here needs a look".
+    func setIcon(enabled: Bool, ok: Bool, attention: Bool) {
         guard let button = statusItem.button else { return }
-        let name = (ok && enabled) ? "personalhotspot" : "personalhotspot.slash"
+        let name = (ok && enabled) ? iconOnSymbol : iconOffSymbol
         let config = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
-        if let image = NSImage(systemSymbolName: name, accessibilityDescription: "Auto Hotspot")?
+        if let base = NSImage(systemSymbolName: name, accessibilityDescription: "Auto Hotspot")?
             .withSymbolConfiguration(config) {
+            let image = attention ? withAttentionDot(base) : base
             image.isTemplate = true
             button.image = image
             button.title = ""
@@ -512,10 +452,39 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             : "hotspotd unavailable"
     }
 
+    /// Composites a small filled dot into the top-right corner of `base`.
+    /// The result stays template-renderable (isTemplate = true) so it still
+    /// tints correctly for the menu bar's light/dark appearance.
+    func withAttentionDot(_ base: NSImage) -> NSImage {
+        let size = base.size
+        let result = NSImage(size: size, flipped: false) { rect in
+            base.draw(in: rect)
+            let dotDiameter: CGFloat = 5
+            let dotRect = NSRect(
+                x: rect.maxX - dotDiameter, y: rect.maxY - dotDiameter,
+                width: dotDiameter, height: dotDiameter)
+            let path = NSBezierPath(ovalIn: dotRect)
+            NSColor.black.setFill()
+            path.fill()
+            return true
+        }
+        result.isTemplate = true
+        return result
+    }
+
     // MARK: - NSMenuDelegate
 
     func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+        // Rebuild synchronously from the cached status first, so the rows
+        // reflect the same state the icon does the instant the menu opens;
+        // the async refresh below then updates titles/state in place.
+        rebuildMenu()
         refresh()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
     }
 
     // MARK: - Shelling out
@@ -542,21 +511,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     struct Status {
         var enabled: Bool = false
-        var agentInstalled: Bool = false
         var agentLoaded: Bool = false
         var watcherRunning: Bool = false
         var locationAuthorized: Bool = false
         var online: Bool = false
         var ssid: String = ""
         var ssidCurrent: String = ""
-        var interface: String = ""
         var wifiPower: String = "Off"
-        var checkInterval: Int = 0
-        var cooldown: Int = 0
-        var hotspotRouter: String = ""  // config key HOTSPOT_ROUTER; the "hotspot_router" JSON field
         var lastJoinResult: String = ""
         var logPath: String = ""
-        var configPath: String = ""
         var ok: Bool = false
     }
 
@@ -570,21 +533,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return result }
 
         result.enabled = (obj["enabled"] as? Bool) ?? false
-        result.agentInstalled = (obj["agent_installed"] as? Bool) ?? false
         result.agentLoaded = (obj["agent_loaded"] as? Bool) ?? false
         result.watcherRunning = (obj["watcher_running"] as? Bool) ?? false
         result.locationAuthorized = (obj["location_authorized"] as? Bool) ?? false
         result.online = (obj["online"] as? Bool) ?? false
         result.ssid = (obj["ssid"] as? String) ?? ""
         result.ssidCurrent = (obj["ssid_current"] as? String) ?? ""
-        result.interface = (obj["interface"] as? String) ?? ""
         result.wifiPower = (obj["wifi_power"] as? String) ?? "Off"
-        result.checkInterval = (obj["check_interval"] as? Int) ?? 0
-        result.cooldown = (obj["cooldown"] as? Int) ?? 0
-        result.hotspotRouter = (obj["hotspot_router"] as? String) ?? ""
         result.lastJoinResult = (obj["last_join_result"] as? String) ?? ""
         result.logPath = (obj["log_path"] as? String) ?? ""
-        result.configPath = (obj["config_path"] as? String) ?? ""
         result.ok = true
         return result
     }
@@ -603,75 +560,45 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applyStatus(_ s: Status) {
-        setIcon(enabled: s.enabled, ok: s.ok)
+        let attention = !s.ok || !problems(s).isEmpty
+        setIcon(enabled: s.enabled, ok: s.ok, attention: attention)
 
         guard s.ok else {
             setHeadline(headlineItem, dot: .systemRed, "hotspotd unavailable")
-            setCaption(subheadItem, abbreviateHome(hotspotdPath))
             toggleItem.state = .off
             toggleItem.isEnabled = false
-            setCaption(targetItem, "—")
-            setSettingRow(rowInterface, "Interface", "—")
-            setSettingRow(rowInterval, "Check every", "—")
-            setSettingRow(rowCooldown, "Retry cooldown", "—")
-            setSettingRow(rowAgent, "Background agent", "unknown")
-            rowAgent.badge = nil
-            setSettingRow(rowWatcher, "Watcher", "—")
-            setSettingRow(rowLocation, "Location access", "—")
-            rowLocation.isEnabled = false
-            setSettingRow(rowRouter, "Hotspot router", "—")
-            setSettingRow(rowLastJoin, "Last join", "—")
-            setSettingRow(rowLog, "Log", "—")
-            rowLog.isEnabled = false
-            setSettingRow(rowConfig, "Config", "—")
+            // Nothing to click for "hotspotd unreachable" — no problem row
+            // exists for it, so there is no menu content that could go stale
+            // here even while the menu is open.
             return
         }
 
-        // Headline: what the network is doing right now.
+        // Status line: Wi-Fi power, online/offline, current or target SSID,
+        // and whether auto-join is paused — all folded into one sentence.
         if s.wifiPower != "On" {
             setHeadline(headlineItem, dot: .systemOrange, "Wi-Fi is off")
         } else if s.online {
-            let where_ = s.ssidCurrent.isEmpty ? "connected" : s.ssidCurrent
-            setHeadline(headlineItem, dot: .systemGreen, "Online \u{2014} \(where_)")
+            if s.ssidCurrent.isEmpty || s.ssidCurrent == "<redacted>" {
+                setHeadline(headlineItem, dot: .systemGreen, "Online")
+            } else {
+                setHeadline(headlineItem, dot: .systemGreen, "Online \u{2014} \(s.ssidCurrent)")
+            }
+        } else if s.enabled {
+            setHeadline(headlineItem, dot: .systemRed, "Offline \u{2014} joining \u{201C}\(s.ssid)\u{201D}")
         } else {
-            setHeadline(headlineItem, dot: .systemRed, "Offline")
-        }
-
-        // Subhead: what the daemon will do about it.
-        if !s.enabled {
-            setCaption(subheadItem, "Auto-join paused")
-        } else if !s.agentLoaded {
-            setCaption(subheadItem, "Agent not running \u{2014} reinstall to resume")
-        } else {
-            setCaption(subheadItem, "Checking every \(humanDuration(s.checkInterval))")
+            setHeadline(headlineItem, dot: .systemRed, "Offline \u{2014} auto-join paused")
         }
 
         toggleItem.isEnabled = !busy
         toggleItem.state = s.enabled ? .on : .off
-        setCaption(targetItem, s.ssid.isEmpty ? "No hotspot configured" : "Joins \u{201C}\(s.ssid)\u{201D} when offline")
 
-        setSettingRow(rowInterface, "Interface", s.interface.isEmpty ? "—" : s.interface)
-        setSettingRow(rowInterval, "Check every", humanDuration(s.checkInterval))
-        setSettingRow(rowCooldown, "Retry cooldown", humanDuration(s.cooldown))
-        setSettingRow(rowAgent, "Background agent",
-                      s.agentLoaded ? "running" : (s.agentInstalled ? "installed, stopped" : "not installed"))
-        // The watcher is the event-driven core from item 4; flag it the moment
-        // it isn't running, since a loaded-but-watcherless agent silently falls
-        // back to the degraded polling-only worker.
-        rowAgent.badge = s.watcherRunning ? nil : NSMenuItemBadge(string: "!")
-
-        setSettingRow(rowWatcher, "Watcher", s.watcherRunning ? "running" : "stopped")
-
-        setSettingRow(rowLocation, "Location access",
-                      s.locationAuthorized ? "granted" : "not granted \u{2014} click to fix")
-        rowLocation.isEnabled = !s.locationAuthorized
-
-        setSettingRow(rowRouter, "Hotspot router", s.hotspotRouter.isEmpty ? "—" : s.hotspotRouter)
-        setSettingRow(rowLastJoin, "Last join", s.lastJoinResult.isEmpty ? "—" : s.lastJoinResult)
-
-        setSettingRow(rowLog, "Log", abbreviateHome(s.logPath))
-        rowLog.isEnabled = true
-        setSettingRow(rowConfig, "Config", abbreviateHome(s.configPath))
+        // Problem rows can only be added/removed while the menu is closed —
+        // never while the user has it open, so a row never appears or
+        // vanishes under the cursor. menuWillOpen already rebuilds
+        // synchronously from `last` the instant the menu opens.
+        if !menuIsOpen {
+            rebuildMenu()
+        }
     }
 
     // MARK: - Actions
@@ -688,22 +615,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    @objc func checkNow() {
-        guard !busy else { return }
-        busy = true
-        checkNowItem.title = "Checking…"
-        checkNowItem.isEnabled = false
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.run(["check"])
-            DispatchQueue.main.async {
-                self?.checkNowItem.title = "Check Now"
-                self?.checkNowItem.isEnabled = true
-                self?.busy = false
-            }
-            self?.refresh()
-        }
-    }
-
     @objc func openLogs() {
         let path = last.logPath.isEmpty
             ? NSHomeDirectory() + "/Library/Logs/auto-hotspot.log"
@@ -715,41 +626,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    /// The Settings "Log" row's own action — reveals the log in Finder. This
-    /// replaces the old standalone "Reveal Log in Finder" item, which was a
-    /// duplicate affordance for the same path already shown right above it.
-    @objc func openLogFolder() {
-        let path = last.logPath.isEmpty
-            ? NSHomeDirectory() + "/Library/Logs/auto-hotspot.log"
-            : last.logPath
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-    }
-
-    /// The Settings "Location access" row's action when access hasn't been
+    /// The Location Services problem row's action when access hasn't been
     /// granted — jumps straight to the Privacy > Location Services pane.
     @objc func openLocationPrefs() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocationServices") else { return }
         NSWorkspace.shared.open(url)
     }
 
-    @objc func editConfig() {
-        let path = last.configPath.isEmpty
-            ? NSHomeDirectory() + "/.config/auto-hotspot/config"
-            : last.configPath
-        guard FileManager.default.fileExists(atPath: path) else {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path).deletingLastPathComponent()])
-            return
+    /// The Wi-Fi-off problem row's action. In-process, no shell-out: the
+    /// same CoreWLAN power-on path the watcher uses on every offline cycle.
+    @objc func turnWifiOn() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = WifiEngine.shared.ensureWifiPowerOn()
+            self?.refresh()
         }
-        // Force a text editor: the config file has no extension, so a plain open can miss.
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        p.arguments = ["-t", path]
-        try? p.run()
     }
 
-    @objc func reinstallAgent() {
+    /// The agent-down problem row's action. Only enables + bootstraps the
+    /// already-installed plist via launchctl — it never rebuilds or re-signs
+    /// the bundle, so the Location Services grant survives. If the repair
+    /// fails the row simply stays visible on the next open.
+    @objc func restartAgent() {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.run(["install"])
+            self?.run(["agent", "load"])
             self?.refresh()
         }
     }

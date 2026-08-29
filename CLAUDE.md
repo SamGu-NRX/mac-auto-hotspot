@@ -24,6 +24,8 @@ Guidance for agents working in this repo.
   app bundle to `~/Applications/AutoHotspot.app`, outside this checkout.
 - `build/` — generated output (the compiled app bundle, before it's installed to
   `~/Applications`). Gitignored.
+- `tools/` — one-off dev scripts (e.g. the icon contact-sheet generator). Never compiled into the
+  app and never run by `install.sh`, `bin/hotspotd`, or the plist.
 
 ## Hard rules
 
@@ -65,6 +67,7 @@ app's `agent.status`, not from anything `bin/hotspotd` probes itself.
 ./install.sh --dry-run
 bin/hotspotd status --json
 AUTO_HOTSPOT_FORCE=1 libexec/auto-hotspot-check.sh
+bin/hotspotd agent load   # (re)bootstrap the launchd agent without rebuilding or re-signing it
 bash -n <script>          # syntax-check every shell file before committing
 swiftc -O -o build/AutoHotspot menubar/AutoHotspot.swift menubar/Wifi.swift
 plutil -lint <rendered-plist>
@@ -114,12 +117,20 @@ Conventional Commits (`feat`, `fix`, `docs`, `chore`, …), imperative mood, low
   and the busy state during `Check Now`.
 - Caption and settings rows are rendered with an explicit `attributedTitle` (secondary colour,
   small system font) rather than relying on the disabled-item appearance, which renders washed out.
-- The status item icon uses `personalhotspot` / `personalhotspot.slash`. Do not go back to
-  `wifi` / `wifi.slash` — that pair reads as "your Wi-Fi is broken" rather than "auto-join is off".
+- The status item icon uses `personalhotspot` / `personalhotspot.slash` — a placeholder pending
+  the pick from the icon contact sheet (`tools/icon-contact-sheet.swift`, see `build/`). `wifi` /
+  `wifi.slash` was tried and rejected: that pair reads as "your Wi-Fi is broken" rather than
+  "auto-join is off". `iconOnSymbol` / `iconOffSymbol` at the top of `AutoHotspot.swift` are the
+  single point of change once a final glyph is chosen.
 - Entry point is `app.run()`, not `NSApplicationMain`, since there is no nib and the delegate is
   assigned by hand.
-- Every field in `hotspotd status --json` should be displayed somewhere in the menu. Adding a key
-  to the CLI's JSON means adding a row here too.
+- The root menu is a status line, problem rows, the Auto-Join Hotspot toggle, and Quit — nothing
+  else. A new `status --json` key earns a menu row only if it produces a problem the user can
+  click to fix; everything informational belongs in `hotspotd doctor`.
+- The menu must never shell out to `hotspotd install` or `hotspotd menubar --rebuild` — either one
+  re-signs the app bundle, which rotates the ad-hoc cdhash and revokes the Location Services
+  grant. `hotspotd agent load` is the safe repair path: it bootstraps the existing plist without
+  touching the binary or its signature.
 
 ## PATH symlink
 

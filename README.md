@@ -91,11 +91,13 @@ caches command lookups. If no writable `PATH` directory exists, the installer sa
 | `install` | Runs the installer (same as `./install.sh`). |
 | `uninstall` | Runs the uninstaller (same as `./uninstall.sh`). |
 | `menubar` | Launches the already-installed app. Add `--rebuild` to compile, re-sign, and reinstall it first. |
+| `agent load` | (Re)bootstraps the launchd agent from the existing plist, without recompiling or re-signing the app bundle. The safe way to recover a stopped agent — the repair the menu bar app itself runs when it needs one. |
 
 `status --json` reports 16 keys: `enabled`, `agent_installed`, `agent_loaded`, `watcher_running`,
 `location_authorized`, `online`, `ssid`, `ssid_current`, `interface`, `wifi_power`,
-`check_interval`, `cooldown`, `hotspot_router`, `last_join_result`, `log_path`, `config_path`. The
-menu bar app renders all of them.
+`check_interval`, `cooldown`, `hotspot_router`, `last_join_result`, `log_path`, `config_path`. All
+16 exist for scripting and for `hotspotd doctor`; the menu bar app surfaces only what needs
+acting on — see "Menu bar app" below.
 
 `on` and `off` both flip the config flag and call `launchctl enable`/`disable`. Pausing or resuming
 never requires a reinstall or rebuild.
@@ -168,9 +170,32 @@ The app lives at `~/Applications/AutoHotspot.app`, built from `menubar/AutoHotsp
 `hotspotd menubar --rebuild` recompiles, re-signs, and reinstalls it — see "One-time Location
 Services prompt" above for why that distinction matters.
 
-The status item icon is the `personalhotspot` SF Symbol, dimmed and slashed when auto-join is
-paused. The menu shows a headline status line, the target hotspot, and a **Settings** submenu
-listing every field from `status --json`, plus **Edit Config…** and **Reveal Log in Finder**.
+The menu is deliberately minimal: nothing to click when everything is healthy beyond the toggle
+and Quit. Root menu, top to bottom:
+
+1. A disabled status line — one sentence covering online/offline and, when known, the current or
+   target SSID (e.g. "● Online — eduroam", "● Offline — auto-join paused").
+2. Zero or more **problem rows**, present only while the condition they cover is true:
+   - **Grant Location Access…** — Location Services isn't authorized, so the app can't read SSIDs
+     and every join is blind. Opens the Privacy pane directly.
+   - **Turn Wi-Fi On** — the radio is off. Turns it on in-process, no shell-out.
+   - **Restart Background Agent** — the launchd agent isn't loaded or the watcher isn't running.
+     Runs `hotspotd agent load`, which never rebuilds or re-signs the app, so the Location
+     Services grant survives.
+   - **Last Join Failed (\<result\>) — Open Log** — still offline after a failed join attempt.
+     Opens the log, which names every SSID the scan actually saw.
+3. **Auto-Join Hotspot** — a checkable toggle.
+4. **Quit Auto Hotspot**.
+
+Everything else — interface, check interval, cooldown, hotspot router, config path, log path,
+target SSID, Check Now, in-app config editing — was cut. `hotspotd doctor` and
+`hotspotd status --json` are the diagnostic surface now; see `docs/decisions/0002-minimal-menu.md`
+for why.
+
+The status item icon is currently the `personalhotspot` SF Symbol (slashed when auto-join is
+paused) — a placeholder. `tools/icon-contact-sheet.swift` renders a contact sheet of candidate
+glyphs (stock SF Symbols and custom-drawn marks, on/off states, light/dark) to `build/`; no final
+choice has been made yet.
 
 To have it start at login, add `~/Applications/AutoHotspot.app` to Login Items yourself; the
 installer doesn't do this for you.
@@ -216,6 +241,11 @@ Exit code 113 means it isn't loaded.
 - **Nothing joins even though the phone is nearby.** Check "Allow Others to Join" on the iPhone
   (see the top of this README) — with it off, no amount of software on the Mac side can wake the
   hotspot.
+- **A join fails with `not_found` even though the toggle still looks on.** iOS silently stops
+  broadcasting Personal Hotspot roughly 90 seconds after the last client disconnects, regardless
+  of what the toggle shows. In the log this looks like a full sweep that found dozens of networks
+  and zero matches for the target SSID. Reconnect once from the iPhone, or just open the Personal
+  Hotspot screen, before testing — either wakes the broadcast back up.
 
 ## License
 

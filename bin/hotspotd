@@ -81,7 +81,12 @@ config_set() {
       esac
     done < "$CONFIG"
   fi
-  printf '%s=%s\n' "$key" "$value" >> "$tmp"
+  # Always double-quote the value. The repo path contains a space, so an
+  # unquoted HOTSPOTD_BIN makes `. "$CONFIG"` fail with
+  # "no such file or directory: repos/...". Escape backslash, double-quote,
+  # backtick and $ so the sourced line can never execute anything.
+  esc_value="$(printf '%s' "$value" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/`/\\`/g' -e 's/\$/\\$/g')"
+  printf '%s="%s"\n' "$key" "$esc_value" >> "$tmp"
   mv -f "$tmp" "$CONFIG"
 }
 
@@ -132,7 +137,10 @@ agent_status_field() {
     return 0
   fi
   if [ "$typ" = "bool" ]; then
-    val="$(sed -n "s/.*\"$key\" *: *\\(true\\|false\\).*/\\1/p" "$AGENT_STATUS_FILE" 2>/dev/null | head -1)"
+    # -E: BSD sed has no \| alternation in basic regex (that's a GNU
+    # extension), so a BRE "\(true\|false\)" matches nothing here and every
+    # boolean silently falls back to its default.
+    val="$(sed -nE "s/.*\"$key\" *: *(true|false).*/\\1/p" "$AGENT_STATUS_FILE" 2>/dev/null | head -1)"
   else
     val="$(sed -n "s/.*\"$key\" *: *\"\\([^\"]*\\)\".*/\\1/p" "$AGENT_STATUS_FILE" 2>/dev/null | head -1)"
   fi
@@ -380,7 +388,15 @@ cmd_menubar() {
   # designated requirement (and the Location Services grant keyed to it)
   # survives rebuilds. Never use --deep: it's deprecated and re-signs
   # nested content we don't have.
-  if security find-identity -v -p codesigning 2>/dev/null | grep -q 'AutoHotspot Signing'; then
+  # Capture then match, never `... | grep -q` — under `set -o pipefail` grep -q
+  # SIGPIPEs the producer on match, the pipeline reports 141, and the test
+  # inverts: the identity would be found yet we'd still sign ad-hoc.
+  _identities="$(security find-identity -v -p codesigning 2>/dev/null)"
+  case "$_identities" in
+    *"AutoHotspot Signing"*) _have_identity=1 ;;
+    *) _have_identity=0 ;;
+  esac
+  if [ "$_have_identity" -eq 1 ]; then
     codesign --force --options runtime --identifier com.andrewwang.autohotspot.menubar \
       --sign 'AutoHotspot Signing' "$ROOT/build/AutoHotspot.app"
   else
@@ -475,7 +491,16 @@ cmd_doctor() {
   fi
 
   if [ -x "$AGENT_EXEC" ]; then
-    if codesign -dvvv "$AGENT_EXEC" 2>&1 | grep -q '^Signature=adhoc'; then
+    # Capture first, then match. `codesign ... | grep -q` looks natural but is
+    # wrong under `set -o pipefail`: grep -q exits on the first match and
+    # SIGPIPEs codesign, so the pipeline reports 141 and the test inverts —
+    # claiming "not ad-hoc" exactly when the signature IS ad-hoc.
+    _sig="$(codesign -dvvv "$AGENT_EXEC" 2>&1)"
+    case "$_sig" in
+      *"Signature=adhoc"*) _is_adhoc=1 ;;
+      *) _is_adhoc=0 ;;
+    esac
+    if [ "$_is_adhoc" -eq 1 ]; then
       finding WARN "ad-hoc code signature (rotates on every rebuild, revokes the Location grant each time)"
     else
       finding OK "code signature is stable (not ad-hoc)"

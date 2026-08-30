@@ -67,10 +67,27 @@ Approve the prompt once and it sticks, as long as the app's code signature doesn
 That's the catch: **an ad-hoc-signed rebuild rotates the signature's ad-hoc cdhash, and macOS treats
 that as a new app — it silently revokes the Location grant and you'll be prompted again.**
 `hotspotd menubar` (no flags) never rebuilds for exactly this reason; only `hotspotd menubar
---rebuild` does. If you rebuild often, create a self-signed codesigning identity named
-`AutoHotspot Signing` in Keychain Access (Certificate Assistant → Create a Certificate → Code
-Signing) — `hotspotd menubar --rebuild` prefers it automatically, and a stable identity's
-Location grant survives rebuilds. `hotspotd doctor` tells you which situation you're in.
+--rebuild` does.
+
+Without a code-signing certificate, `hotspotd menubar --rebuild` protects the grant a different
+way: it hashes `menubar/AutoHotspot.swift`, `menubar/Wifi.swift`, and `menubar/Info.plist`, and
+compares that against the fingerprint recorded after the last successful install. If they match —
+and the installed app is still there — it skips the compile/sign/reinstall entirely and prints a
+line saying so, instead of doing pointless work that would rotate the cdhash for no reason.
+Rerunning `./install.sh` to fix something unrelated is safe: the app is untouched unless the
+sources actually changed. `install.sh` prints "App bundle: preserved" or "App bundle: rebuilt"
+near the end of its output so you know at a glance whether you'll need to re-approve Location.
+Pass `--force` to `hotspotd menubar --rebuild --force` when you genuinely need to rebuild despite
+unchanged sources (for example, after switching signing identities).
+
+No code-signing certificate is needed. The fingerprint check is what keeps the grant alive: a
+rebuild only happens when you actually change the source, so approving Location once covers every
+reinstall, repair and re-run after that.
+
+If you are editing the Swift sources many times a day and would rather not re-approve on each
+build, a self-signed identity named `AutoHotspot Signing` (Keychain Access → Certificate
+Assistant → Create a Certificate → Code Signing) is picked up automatically and keeps the grant
+across rebuilds too. It is strictly optional.
 
 ## Usage
 
@@ -90,7 +107,7 @@ caches command lookups. If no writable `PATH` directory exists, the installer sa
 | `logs` | Prints the log file. Add `-f` to follow it, `--open` to open it in the default app. |
 | `install` | Runs the installer (same as `./install.sh`). |
 | `uninstall` | Runs the uninstaller (same as `./uninstall.sh`). |
-| `menubar` | Launches the already-installed app. Add `--rebuild` to compile, re-sign, and reinstall it first. |
+| `menubar` | Launches the already-installed app. Add `--rebuild` to compile, re-sign, and reinstall it first — this is skipped automatically when sources are unchanged since the last install (see above); add `--force` to rebuild anyway. |
 | `agent load` | (Re)bootstraps the launchd agent from the existing plist, without recompiling or re-signing the app bundle. The safe way to recover a stopped agent — the repair the menu bar app itself runs when it needs one. |
 
 `status --json` reports 16 keys: `enabled`, `agent_installed`, `agent_loaded`, `watcher_running`,
@@ -233,8 +250,10 @@ Exit code 113 means it isn't loaded.
 - **The menu bar shows `ssid_current` as `<redacted>`.** Same cause: something (usually
   `ipconfig getsummary`) is reading the SSID without the Location grant. Check `location_authorized`
   in `status --json` — if it's `false`, re-launch the app and approve the prompt.
-- **Location keeps re-prompting after every rebuild.** You're on an ad-hoc signature, which
-  rotates its cdhash on every build. Create the `AutoHotspot Signing` identity described above.
+- **Location keeps re-prompting after every rebuild.** Ad-hoc signatures rotate their cdhash on
+  every build, so each rebuild is a new app identity. Normally you never see this, because
+  `install.sh` skips the rebuild while the sources are unchanged — if you are seeing it repeatedly,
+  something is changing the fingerprint inputs (the two Swift files or `Info.plist`) between runs.
 - **Join fails with a privileges complaint in the log.** Join the hotspot once by hand from the
   Wi-Fi menu. That stores the credential for your user account, after which the app's join will
   work.

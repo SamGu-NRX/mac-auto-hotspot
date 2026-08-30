@@ -51,7 +51,7 @@ These five files must agree, and any change to one of these values must land in 
 | config path | `~/.config/auto-hotspot/config` |
 | log path | `~/Library/Logs/auto-hotspot.log` |
 | state dir | `~/.local/state/auto-hotspot/` |
-| state dir contents | `last-join-attempt` (cooldown timestamp), `lock/` (mkdir-based lock), `trigger` (CLI touches this to poke the running agent into an immediate check), `agent.status` (JSON the app writes; the CLI's only source for fields it can't probe itself) |
+| state dir contents | `last-join-attempt` (cooldown timestamp), `lock/` (mkdir-based lock), `trigger` (CLI touches this to poke the running agent into an immediate check), `agent.status` (JSON the app writes; the CLI's only source for fields it can't probe itself), `build-fingerprint` (SHA-256 over `menubar/AutoHotspot.swift` + `menubar/Wifi.swift` + `menubar/Info.plist`, written by `hotspotd menubar --rebuild` after a successful install; a match skips the next rebuild so the ad-hoc signature — and the Location Services grant keyed to it — survives a routine reinstall) |
 | launchd domain | `gui/$(id -u)` |
 | config keys | `SSID`, `CHECK_INTERVAL` (default 300, a safety-net poll interval inside the app — not a periodic launchd job), `COOLDOWN` (default 30), `ENABLED`, `WIFI_INTERFACE`, `HOTSPOT_ROUTER` (default `172.20.10.1`, the iPhone tethering gateway IP a join is verified against), `NOTIFY`, `HOTSPOTD_BIN` |
 
@@ -87,8 +87,18 @@ Env overrides for testing without touching the real install: `AUTO_HOTSPOT_CONFI
 - Ad-hoc `codesign` on the app bundle is mandatory. Without it, macOS refuses to launch the app.
   But an ad-hoc signature's cdhash rotates on every rebuild, which macOS treats as a new app
   identity and silently revokes the Location Services grant — that's why `hotspotd menubar` with
-  no flags never rebuilds, and why a stable, user-created `AutoHotspot Signing` identity (see
-  `security find-identity`) is preferred over ad-hoc whenever one exists.
+  no flags never rebuilds, and why the build fingerprint (below) exists. `swiftc` is not
+  reproducible, so rebuilding identical sources still rotates the cdhash: two builds of the same
+  source differ even with `-Xlinker -no_uuid`. Not rebuilding is the only fix. A user-created
+  `AutoHotspot Signing` identity (see `security find-identity`) is used when one exists, but it is
+  optional and must never be presented as required.
+- `hotspotd menubar --rebuild` is itself signature-preserving without a certificate: it compares a
+  SHA-256 over the Swift sources and `Info.plist` against `build-fingerprint` in the state dir, and
+  skips the compile/sign/ditto sequence entirely when they match and the installed executable is
+  still present — swiftc isn't reproducible, so any actual rebuild rotates the ad-hoc cdhash and
+  revokes the Location Services grant, even when nothing meaningful changed. `install.sh` inherits
+  this for free, since it always calls `menubar --rebuild --build-only`. Pass `--force` to bypass
+  the skip and rebuild unconditionally.
 - `LSUIElement` in `Info.plist` is what hides the Dock icon for the app.
 - `networksetup -setairportnetwork` exits 0 whether the join succeeded or failed. Its exit code
   must never be trusted; parse its stdout and, more importantly, verify the outcome against the
@@ -134,12 +144,15 @@ Conventional Commits (`feat`, `fix`, `docs`, `chore`, …), imperative mood, low
 - `rebuildMenu()` only runs from a live status update while the menu is closed (`!menuIsOpen`) —
   `menuWillOpen` already rebuilds synchronously the instant the menu opens. Adding or removing a
   problem row while the user has the menu open would make a row appear or vanish under the cursor.
-- The status item icon uses `antenna.radiowaves.left.and.right` / `.slash`: the only
-  strong candidate with a real Apple-drawn `.slash` variant, so the OFF state stays
-  crisp instead of getting a hand-drawn diagonal. Do not go back to `wifi` /
-  `wifi.slash` — that pair reads as "your Wi-Fi is broken" rather than "auto-join is
-  off". `iconOnSymbol` / `iconOffSymbol` at the top of `AutoHotspot.swift` are the
-  single point of change if the glyph ever needs to change again.
+- The status item icon uses `iphone.radiowaves.left.and.right` / `iphone.slash`. The
+  ON glyph's own `.slash` variant — `iphone.radiowaves.left.and.right.slash` — does
+  not exist on this SDK (`NSImage(systemSymbolName:)` returns nil for it), so the OFF
+  state falls back to the plain, Apple-drawn `iphone.slash` instead; it isn't a slash
+  variant of the ON glyph, but it shares the same phone silhouette so the pair still
+  reads as one family. Do not go back to `wifi` / `wifi.slash` — that pair reads as
+  "your Wi-Fi is broken" rather than "auto-join is off". `iconOnSymbol` /
+  `iconOffSymbol` at the top of `AutoHotspot.swift` are the single point of change if
+  the glyph ever needs to change again.
 - Entry point is `app.run()`, not `NSApplicationMain`, since there is no nib and the delegate is
   assigned by hand.
 - The root menu is a status line, problem rows, the Auto-Join Hotspot toggle, and Quit — nothing

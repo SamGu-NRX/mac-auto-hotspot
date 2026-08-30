@@ -20,6 +20,11 @@ AGENT_EXEC="$APP_PATH/Contents/MacOS/AutoHotspot"
 # New state files the app writes/reads; last-join-attempt and lock are unchanged.
 TRIGGER_FILE="$STATE_DIR/trigger"
 AGENT_STATUS_FILE="$STATE_DIR/agent.status"
+# Digest over the exact inputs that determine the built bundle, written after
+# a successful `menubar --rebuild` install. Lets cmd_menubar skip a rebuild
+# (and the ad-hoc cdhash rotation, and the Location Services grant that goes
+# with it) when the sources haven't actually changed since the last install.
+BUILD_FINGERPRINT_FILE="$STATE_DIR/build-fingerprint"
 # The full installed path, not just "AutoHotspot.app/Contents/MacOS/AutoHotspot":
 # that substring also matches a locally-built build/AutoHotspot.app binary
 # during development, which would make `hotspotd check`/`doctor` mistake a
@@ -357,14 +362,24 @@ cmd_uninstall() {
   exec "$ROOT/uninstall.sh" "$@"
 }
 
+# Digest over every input that determines the built bundle's Mach-O and
+# Info.plist. Order and quoting matter: swiftc is not reproducible byte for
+# byte, but the *source* is what we key skip/rebuild on, not the binary.
+compute_build_fingerprint() {
+  cat "$ROOT/menubar/AutoHotspot.swift" "$ROOT/menubar/Wifi.swift" "$ROOT/menubar/Info.plist" 2>/dev/null \
+    | shasum -a 256 | awk '{print $1}'
+}
+
 cmd_menubar() {
   load_config
   rebuild=0
   build_only=0
+  force=0
   for a in "$@"; do
     case "$a" in
       --rebuild) rebuild=1 ;;
       --build-only) build_only=1 ;;
+      --force) force=1 ;;
     esac
   done
 
@@ -381,6 +396,32 @@ cmd_menubar() {
     return 0
   fi
 
+  # --rebuild and/or --build-only, without --force: skip the whole
+  # compile/sign/ditto sequence when the installed bundle is intact and the
+  # sources haven't changed since the last install. swiftc isn't
+  # reproducible, so any rebuild rotates the ad-hoc cdhash and silently
+  # revokes the Location Services grant the user had to approve by hand —
+  # this is what makes a routine reinstall signature-preserving.
+  #
+  # Fail safe in every direction: a missing/unreadable fingerprint file, a
+  # missing bundle, or a non-executable binary all fall through to a rebuild
+  # below. Only an exact match on both an installed executable and a
+  # readable, matching fingerprint skips.
+  if [ "$force" -eq 0 ] && [ -x "$AGENT_EXEC" ]; then
+    _current_fp="$(compute_build_fingerprint)"
+    _stored_fp=""
+    if [ -r "$BUILD_FINGERPRINT_FILE" ]; then
+      _stored_fp="$(cat "$BUILD_FINGERPRINT_FILE" 2>/dev/null)"
+    fi
+    if [ -n "$_current_fp" ] && [ -n "$_stored_fp" ] && [ "$_current_fp" = "$_stored_fp" ]; then
+      echo "hotspotd: sources unchanged since last install; skipping rebuild to preserve the Location Services grant (use --force to rebuild anyway)."
+      if [ "$build_only" -eq 0 ]; then
+        open -g "$APP_PATH"
+      fi
+      return 0
+    fi
+  fi
+
   # --rebuild and/or --build-only: compile, sign, and reinstall the bundle.
   mkdir -p "$ROOT/build/AutoHotspot.app/Contents/MacOS"
   swiftc -O -o "$ROOT/build/AutoHotspot.app/Contents/MacOS/AutoHotspot" \
@@ -390,7 +431,12 @@ cmd_menubar() {
     err "swiftc build failed"
     return 1
   fi
-  cp "$ROOT/menubar/Info.plist" "$ROOT/build/AutoHotspot.app/Contents/Info.plist"
+  # A bundle missing Info.plist still signs cleanly but will not launch, so
+  # a failed copy must stop the build rather than produce a broken install.
+  if ! cp "$ROOT/menubar/Info.plist" "$ROOT/build/AutoHotspot.app/Contents/Info.plist"; then
+    err "could not copy Info.plist into the bundle"
+    return 1
+  fi
 
   # Prefer a stable, user-created signing identity over ad-hoc so the
   # designated requirement (and the Location Services grant keyed to it)
@@ -407,12 +453,17 @@ cmd_menubar() {
   if [ "$_have_identity" -eq 1 ]; then
     codesign --force --options runtime --identifier com.andrewwang.autohotspot.menubar \
       --sign 'AutoHotspot Signing' "$ROOT/build/AutoHotspot.app"
+    codesign_rc=$?
   else
     codesign --force --options runtime --identifier com.andrewwang.autohotspot.menubar \
       --sign - "$ROOT/build/AutoHotspot.app"
-    err "warning: signed ad-hoc (no 'AutoHotspot Signing' identity found in the keychain)."
-    err "warning: the ad-hoc signature rotates on every rebuild, so macOS will re-prompt for Location access each time."
-    err "warning: create a self-signed codesigning identity named 'AutoHotspot Signing' (Keychain Access > Certificate Assistant) to keep it stable."
+    codesign_rc=$?
+    err "note: signed ad-hoc, so this build has a new identity and macOS will ask for Location access once more."
+    err "note: reinstalling will not ask again — the build fingerprint makes install.sh skip the rebuild while the sources are unchanged."
+  fi
+  if [ "$codesign_rc" -ne 0 ]; then
+    err "codesign failed (exit $codesign_rc); not installing or recording a build fingerprint"
+    return 1
   fi
   xattr -dr com.apple.quarantine "$ROOT/build/AutoHotspot.app" 2>/dev/null || true
 
@@ -420,12 +471,27 @@ cmd_menubar() {
   pkill -f "$AGENT_EXEC" 2>/dev/null || true
   rm -rf "$APP_PATH"
   ditto "$ROOT/build/AutoHotspot.app" "$APP_PATH"
+  ditto_rc=$?
+  if [ "$ditto_rc" -ne 0 ]; then
+    err "ditto failed (exit $ditto_rc); not recording a build fingerprint for a possibly-incomplete install"
+    return 1
+  fi
+
+  # Record the fingerprint only after a successful install, so a failed or
+  # partial build never gets mistaken for an up-to-date one on the next run.
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  _new_fp="$(compute_build_fingerprint)"
+  if [ -n "$_new_fp" ]; then
+    printf '%s\n' "$_new_fp" > "$BUILD_FINGERPRINT_FILE"
+  fi
+  echo "hotspotd: rebuilt and reinstalled AutoHotspot.app (new signature; re-approve Location Services if prompted)."
 
   config_set HOTSPOTD_BIN "$BIN_DIR/hotspotd"
 
   if [ "$build_only" -eq 0 ]; then
     open -g "$APP_PATH"
   fi
+  return 0
 }
 
 cmd_agent() {
@@ -572,7 +638,9 @@ subcommands:
   logs            show recent log lines (logs [N] | logs -f | logs --open)
   install         install the launchd agent (delegates to install.sh)
   uninstall       remove the launchd agent (delegates to uninstall.sh)
-  menubar         launch the installed menu bar app (menubar --rebuild to build, sign, and reinstall it)
+  menubar         launch the installed menu bar app (menubar --rebuild to build, sign, and reinstall it;
+                  --rebuild skips the build when sources are unchanged since the last install, to keep
+                  the ad-hoc signature and Location Services grant stable — pass --force to rebuild anyway)
   agent load    (re)bootstrap the launchd agent without rebuilding or re-signing it
   help            show this help
   version         print the version

@@ -213,7 +213,16 @@ echo "==> Building and installing the menu bar app (agent)"
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "would run: $ROOT/bin/hotspotd menubar --rebuild --build-only"
 else
-  if ! "$ROOT/bin/hotspotd" menubar --rebuild --build-only; then
+  # hotspotd menubar --rebuild is itself signature-preserving: it skips the
+  # actual compile/sign/ditto (and prints a line saying so) when the sources
+  # haven't changed since the last install. Capture its output so we can
+  # tell the user, at the end of this run, whether the app was rebuilt
+  # (new ad-hoc signature — Location Services may need to be re-approved)
+  # or preserved (nothing to re-approve).
+  _menubar_output="$("$ROOT/bin/hotspotd" menubar --rebuild --build-only 2>&1)"
+  _menubar_rc=$?
+  printf '%s\n' "$_menubar_output"
+  if [ $_menubar_rc -ne 0 ]; then
     echo "error: failed to build/sign/install AutoHotspot.app" >&2
     exit 1
   fi
@@ -221,6 +230,10 @@ else
     echo "error: $AGENT_EXEC is missing after build; the agent cannot be installed" >&2
     exit 1
   fi
+  case "$_menubar_output" in
+    *"skipping rebuild"*) APP_BUILD_STATUS="preserved" ;;
+    *) APP_BUILD_STATUS="rebuilt" ;;
+  esac
   echo "installed $APP_PATH"
 fi
 
@@ -365,6 +378,13 @@ else
 fi
 
 echo "==> Done"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "App bundle: not built (--dry-run)"
+elif [ "${APP_BUILD_STATUS:-}" = "preserved" ]; then
+  echo "App bundle: preserved (sources unchanged, signature unchanged) — no need to re-grant Location Services"
+else
+  echo "App bundle: rebuilt (new ad-hoc signature) — macOS may ask you to re-grant Location Services"
+fi
 cat <<EOF
 Next steps (open a new shell first, or run: hash -r)
   hotspotd status   check current state

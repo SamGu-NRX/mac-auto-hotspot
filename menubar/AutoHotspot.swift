@@ -48,12 +48,15 @@ func locateHotspotd() -> String {
 
 // MARK: - Menu bar glyphs
 //
-// antenna.radiowaves.left.and.right / .slash, not personalhotspot: it's the only
-// strong candidate with a real Apple-drawn .slash variant, so the OFF state stays
-// crisp instead of getting a hand-drawn diagonal through it. Not wifi/wifi.slash
-// either — that pair reads as "your Wi-Fi is broken" rather than "auto-join is off".
-let iconOnSymbol = "antenna.radiowaves.left.and.right"
-let iconOffSymbol = "antenna.radiowaves.left.and.right.slash"
+// iphone.radiowaves.left.and.right / iphone.slash. The ON glyph's own .slash
+// variant — iphone.radiowaves.left.and.right.slash — doesn't exist on this SDK
+// (NSImage(systemSymbolName:) returns nil), so the OFF state uses the plain,
+// Apple-drawn iphone.slash instead. It isn't a slash variant of the ON glyph,
+// but it shares the same phone silhouette, so the pair still reads as one
+// family. Not wifi/wifi.slash — that pair reads as "your Wi-Fi is broken"
+// rather than "auto-join is off".
+let iconOnSymbol = "iphone.radiowaves.left.and.right"
+let iconOffSymbol = "iphone.slash"
 
 // MARK: - Watcher
 //

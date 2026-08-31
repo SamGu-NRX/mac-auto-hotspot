@@ -808,6 +808,16 @@ final class WifiEngine {
     }
 }
 
+/// Distinguishes "we never touched the radio" from "we dropped the hotspot and
+/// could not get back". Collapsing these into one Bool made the caller restore
+/// a hotspot it had never left: walking around with no saved network in range
+/// disassociated and rejoined a perfectly good hotspot on every backoff tick.
+enum FailbackOutcome {
+    case notAttempted
+    case succeeded
+    case failed
+}
+
 // MARK: - Failback
 //
 // The hotspot and every real network share one radio, so returning to Wi-Fi
@@ -866,13 +876,13 @@ extension WifiEngine {
     /// saved network in range like any other); that counts as a failure, and
     /// the caller backs off. The engine self-corrects rather than trying to
     /// out-guess macOS's ranking.
-    func attemptFailback(config: RuntimeConfig) -> Bool {
-        guard let interface = CWWiFiClient.shared().interface() else { return false }
+    func attemptFailback(config: RuntimeConfig) -> FailbackOutcome {
+        guard let interface = CWWiFiClient.shared().interface() else { return .notAttempted }
 
         let candidates = failbackCandidates(config: config)
         guard !candidates.isEmpty else {
             wifiLog("info", "failback: no saved non-hotspot network in range; staying on hotspot")
-            return false
+            return .notAttempted
         }
         wifiLog("info", "failback: candidates in range: \(candidates.joined(separator: ", "))")
 
@@ -886,15 +896,15 @@ extension WifiEngine {
             let status = probeStatus(interface: config.interface)
             if status == .online {
                 wifiLog("info", "failback: back on \(now) with verified internet")
-                return true
+                return .succeeded
             }
             if status == .captivePortal {
                 wifiLog("warn", "failback: \(now) is up but behind a captive portal; sign in to use it")
-                return false
+                return .failed
             }
         }
 
         wifiLog("warn", "failback: gave up after \(config.failbackSettle)s (now on \(interface.ssid() ?? "nothing"))")
-        return false
+        return .failed
     }
 }

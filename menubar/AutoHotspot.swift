@@ -336,15 +336,23 @@ final class Watcher {
 
         writeFailbackAttempt()
 
-        if WifiEngine.shared.attemptFailback(config: config) {
+        let outcome = WifiEngine.shared.attemptFailback(config: config)
+
+        if outcome == .succeeded {
             clearFailbackState()
             return true
         }
 
-        // Failed: back off, then get the hotspot back immediately rather than
-        // waiting out another full strike cycle to rediscover we are offline.
         let next = min(max(wait * 2, config.failbackInterval), config.failbackBackoffMax)
         writeFailbackBackoff(next)
+
+        // Nothing was in range, so the hotspot was never dropped. Backing off is
+        // right; touching the radio is not.
+        if outcome == .notAttempted {
+            wifiLog("info", "failback: nothing to switch to, next attempt in \(next)s")
+            return true
+        }
+
         wifiLog("info", "failback: unsuccessful, next attempt in \(next)s; restoring hotspot")
 
         let restore = WifiEngine.shared.join(ssid: config.ssid, forceRejoin: true)

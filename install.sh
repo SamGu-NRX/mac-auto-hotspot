@@ -48,7 +48,7 @@ Usage: install.sh [options]
 Installs the auto-hotspot LaunchAgent for the current user (must not run as root).
 
 Options:
-  --ssid NAME          Hotspot SSID to join when offline (default: Andrew’s iPhone)
+  --ssid NAME          Hotspot SSID to join when offline (default: Sam Gu’s iPhone)
   --interval SECONDS   Safety-net poll interval, read at runtime by the agent (default: 300)
   --cooldown SECONDS   Minimum seconds between join attempts (default: 30)
   --interface NAME     Wi-Fi interface to manage (default: en0)
@@ -167,13 +167,32 @@ else
   if [ ! -f "$CONFIG" ]; then
     {
       echo "# auto-hotspot configuration"
-      printf 'SSID="Andrew\342\200\231s iPhone"\n'
+      printf 'SSID="Sam Gu\342\200\231s iPhone"\n'
       echo "CHECK_INTERVAL=300"
       echo "COOLDOWN=30"
       echo "ENABLED=1"
       echo "WIFI_INTERFACE=\"en0\""
       echo "HOTSPOT_ROUTER=\"172.20.10.1\""
       echo "NOTIFY=1"
+      echo ""
+      echo "# Consecutive failed probes before leaving Wi-Fi for the hotspot,"
+      echo "# and the gap between them. 3 x 5s tolerates a congested campus"
+      echo "# network without reading it as an outage. Set to 1 for upstream's"
+      echo "# single-probe behaviour."
+      echo "FAILOVER_STRIKES=3"
+      echo "STRIKE_INTERVAL=5"
+      echo ""
+      echo "# Return to Wi-Fi automatically once it works again."
+      echo "FAILBACK=1"
+      echo "# Seconds between failback attempts. Doubles after each failure,"
+      echo "# capped at FAILBACK_BACKOFF_MAX, and resets on success or wake."
+      echo "FAILBACK_INTERVAL=180"
+      echo "FAILBACK_BACKOFF_MAX=1200"
+      echo "# Seconds to wait for association + DHCP after leaving the"
+      echo "# hotspot. 802.1X (eduroam, utexas) needs longer than a PSK join."
+      echo "FAILBACK_SETTLE=12"
+      echo "# Do not drop a working hotspot for a network weaker than this."
+      echo "FAILBACK_MIN_RSSI=-75"
     } > "$CONFIG"
     echo "created $CONFIG"
   else

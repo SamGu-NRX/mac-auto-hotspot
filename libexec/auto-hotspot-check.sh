@@ -30,7 +30,7 @@ AGENT_EXEC="$APP_PATH/Contents/MacOS/AutoHotspot"
 # ---- defaults, then source config ----
 # Literal U+2019 RIGHT SINGLE QUOTATION MARK below (not ASCII '). See the
 # matching printf-octal form (with this same comment) in bin/hotspotd.
-SSID="Andrew’s iPhone"
+SSID="Sam Gu’s iPhone"
 CHECK_INTERVAL=300
 ENABLED=1
 COOLDOWN=30
@@ -172,7 +172,28 @@ current_ssid() {
     printf '%s' "$_s"
 }
 
-if probe_online; then
+# Mirror the app's strike gate: one probe decides "online", but a failure is
+# retried before it is believed. Failback is deliberately NOT mirrored here —
+# this script only runs when the menu bar agent is down, and dropping a
+# working hotspot from a degraded fallback path is not a good trade.
+FAILOVER_STRIKES="${FAILOVER_STRIKES:-3}"
+STRIKE_INTERVAL="${STRIKE_INTERVAL:-5}"
+
+confirm_offline() {
+    _i=1
+    while [ "$_i" -le "$FAILOVER_STRIKES" ]; do
+        if probe_online; then
+            [ "$_i" -gt 1 ] && log info "probe: recovered on attempt $_i/$FAILOVER_STRIKES, no failover"
+            return 1
+        fi
+        _i=$(( _i + 1 ))
+        [ "$_i" -le "$FAILOVER_STRIKES" ] && sleep "$STRIKE_INTERVAL"
+    done
+    log info "probe: $FAILOVER_STRIKES consecutive failures"
+    return 0
+}
+
+if ! confirm_offline; then
     _ssid_now="$(current_ssid)"
     log info "online via $_ssid_now"
     [ -f "$LAST_JOIN_FILE" ] && /bin/rm -f "$LAST_JOIN_FILE"

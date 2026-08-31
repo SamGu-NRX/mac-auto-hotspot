@@ -28,6 +28,8 @@ enum WifiPaths {
     static var triggerPath: String { stateDir + "/trigger" }
     static var lockPath: String { stateDir + "/lock" }
     static var lastJoinAttemptPath: String { stateDir + "/last-join-attempt" }
+    static var failbackAttemptPath: String { stateDir + "/failback-attempt" }
+    static var failbackBackoffPath: String { stateDir + "/failback-backoff" }
 }
 
 // MARK: - Runtime config
@@ -45,6 +47,28 @@ struct RuntimeConfig {
     var interface: String
     var hotspotRouter: String
     var notify: Bool
+    /// Consecutive failed probes required before leaving Wi-Fi for the
+    /// hotspot. Upstream failed over on a single 4s-timeout probe, which a
+    /// congested-but-working campus network trips routinely.
+    var failoverStrikes: Int
+    /// Seconds between those probes.
+    var strikeInterval: Int
+    /// Whether to return to Wi-Fi once it works again. Upstream had no
+    /// failback at all: once on the hotspot the probe succeeds *through* the
+    /// hotspot, so nothing ever moves you back.
+    var failback: Bool
+    /// Minimum seconds between failback attempts, and the base of the
+    /// exponential backoff applied after each failed one.
+    var failbackInterval: Int
+    /// Ceiling for that backoff.
+    var failbackBackoffMax: Int
+    /// Seconds to wait for association + DHCP after leaving the hotspot.
+    /// 802.1X (eduroam/utexas) needs an EAP+RADIUS handshake, so this is
+    /// deliberately longer than the 3s the hotspot join settles for.
+    var failbackSettle: Int
+    /// Candidate networks weaker than this are not worth dropping a working
+    /// hotspot for.
+    var failbackMinRSSI: Int
 }
 
 private func unquoteConfigValue(_ raw: String) -> String {
@@ -58,13 +82,20 @@ private func unquoteConfigValue(_ raw: String) -> String {
 
 func loadRuntimeConfig() -> RuntimeConfig {
     var config = RuntimeConfig(
-        ssid: "Andrew\u{2019}s iPhone",
+        ssid: "Sam Gu\u{2019}s iPhone",
         checkInterval: 300,
         enabled: true,
         cooldown: 30,
         interface: "en0",
         hotspotRouter: "172.20.10.1",
-        notify: true
+        notify: true,
+        failoverStrikes: 3,
+        strikeInterval: 5,
+        failback: true,
+        failbackInterval: 180,
+        failbackBackoffMax: 1200,
+        failbackSettle: 12,
+        failbackMinRSSI: -75
     )
 
     guard let contents = try? String(contentsOfFile: WifiPaths.configPath, encoding: .utf8) else {
@@ -90,6 +121,20 @@ func loadRuntimeConfig() -> RuntimeConfig {
             if !v.isEmpty { config.hotspotRouter = v }
         } else if line.hasPrefix("NOTIFY=") {
             config.notify = unquoteConfigValue(String(line.dropFirst("NOTIFY=".count))) == "1"
+        } else if line.hasPrefix("FAILOVER_STRIKES=") {
+            if let n = Int(unquoteConfigValue(String(line.dropFirst("FAILOVER_STRIKES=".count)))), n >= 1 { config.failoverStrikes = n }
+        } else if line.hasPrefix("STRIKE_INTERVAL=") {
+            if let n = Int(unquoteConfigValue(String(line.dropFirst("STRIKE_INTERVAL=".count)))), n >= 0 { config.strikeInterval = n }
+        } else if line.hasPrefix("FAILBACK=") {
+            config.failback = unquoteConfigValue(String(line.dropFirst("FAILBACK=".count))) == "1"
+        } else if line.hasPrefix("FAILBACK_INTERVAL=") {
+            if let n = Int(unquoteConfigValue(String(line.dropFirst("FAILBACK_INTERVAL=".count)))), n >= 30 { config.failbackInterval = n }
+        } else if line.hasPrefix("FAILBACK_BACKOFF_MAX=") {
+            if let n = Int(unquoteConfigValue(String(line.dropFirst("FAILBACK_BACKOFF_MAX=".count)))), n >= 30 { config.failbackBackoffMax = n }
+        } else if line.hasPrefix("FAILBACK_SETTLE=") {
+            if let n = Int(unquoteConfigValue(String(line.dropFirst("FAILBACK_SETTLE=".count)))), n >= 1 { config.failbackSettle = n }
+        } else if line.hasPrefix("FAILBACK_MIN_RSSI=") {
+            if let n = Int(unquoteConfigValue(String(line.dropFirst("FAILBACK_MIN_RSSI=".count)))) { config.failbackMinRSSI = n }
         }
     }
 
@@ -127,10 +172,52 @@ func runTool(_ path: String, _ args: [String]) -> (Int32, String) {
 // Bound to the Wi-Fi interface via curl --interface so the probe reflects
 // that interface's route, not whichever interface currently owns default.
 
-func probeOnline(interface: String) -> Bool {
-    let (_, out) = runTool("/usr/bin/curl", ["-sS", "-m", "4", "--interface", interface,
+/// Upstream collapsed "no route at all" and "a captive portal answered" into
+/// one boolean. They need different handling: both mean no internet, but a
+/// portal means the network is physically fine and just wants a login, which
+/// is worth saying out loud instead of silently burning cellular all day.
+enum ProbeStatus: String {
+    case online
+    case captivePortal
+    case offline
+}
+
+func probeStatus(interface: String) -> ProbeStatus {
+    let (rc, out) = runTool("/usr/bin/curl", ["-sS", "-m", "4", "--interface", interface,
                                               "http://captive.apple.com/hotspot-detect.html"])
-    return out.contains("<TITLE>Success</TITLE>")
+    if out.contains("<TITLE>Success</TITLE>") { return .online }
+    // Something answered on this interface but it is not Apple's page: the
+    // signature of a portal intercepting the request.
+    if rc == 0 && !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return .captivePortal }
+    return .offline
+}
+
+func probeOnline(interface: String) -> Bool {
+    return probeStatus(interface: interface) == .online
+}
+
+/// One probe decides "online" (fast path, unchanged). Only a *failure* costs
+/// extra: it is re-tried `failoverStrikes` times `strikeInterval` apart, and
+/// any single success aborts the whole thing. This is the asymmetry that
+/// keeps a 4-second timeout on congested campus Wi-Fi from being read as an
+/// outage, at the price of ~15s before a genuine one triggers failover.
+func confirmProbe(config: RuntimeConfig) -> ProbeStatus {
+    var last = probeStatus(interface: config.interface)
+    if last == .online { return last }
+
+    let extra = max(0, config.failoverStrikes - 1)
+    for i in 0..<extra {
+        Thread.sleep(forTimeInterval: Double(config.strikeInterval))
+        last = probeStatus(interface: config.interface)
+        if last == .online {
+            wifiLog("info", "probe: recovered on attempt \(i + 2)/\(config.failoverStrikes), no failover")
+            return last
+        }
+    }
+    if config.failoverStrikes > 1 {
+        wifiLog("info", "probe: \(config.failoverStrikes) consecutive failures (last=\(last.rawValue))")
+    }
+    return last
 }
 
 func currentRouter(interface: String) -> String {
@@ -201,6 +288,41 @@ func writeLastJoinAttempt() {
 
 func clearLastJoinAttempt() {
     try? FileManager.default.removeItem(atPath: WifiPaths.lastJoinAttemptPath)
+}
+
+// MARK: - Failback state
+//
+// Two files: when failback was last attempted, and how long to wait before
+// the next one. The wait doubles on each failure so a campus network that is
+// up-but-portalled does not get probed every three minutes forever.
+
+func readFailbackAttempt() -> TimeInterval? {
+    guard let s = try? String(contentsOfFile: WifiPaths.failbackAttemptPath, encoding: .utf8) else { return nil }
+    return TimeInterval(s.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+func writeFailbackAttempt() {
+    try? FileManager.default.createDirectory(atPath: WifiPaths.stateDir, withIntermediateDirectories: true)
+    try? "\(Int(Date().timeIntervalSince1970))".write(toFile: WifiPaths.failbackAttemptPath, atomically: true, encoding: .utf8)
+}
+
+func readFailbackBackoff() -> Int? {
+    guard let s = try? String(contentsOfFile: WifiPaths.failbackBackoffPath, encoding: .utf8) else { return nil }
+    return Int(s.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+
+func writeFailbackBackoff(_ seconds: Int) {
+    try? FileManager.default.createDirectory(atPath: WifiPaths.stateDir, withIntermediateDirectories: true)
+    try? "\(seconds)".write(toFile: WifiPaths.failbackBackoffPath, atomically: true, encoding: .utf8)
+}
+
+/// Called whenever we are online on something that is not the hotspot, so a
+/// later offline episode starts from a clean slate rather than inheriting a
+/// stale 20-minute backoff.
+func clearFailbackState() {
+    let fm = FileManager.default
+    try? fm.removeItem(atPath: WifiPaths.failbackAttemptPath)
+    try? fm.removeItem(atPath: WifiPaths.failbackBackoffPath)
 }
 
 // MARK: - Offline notification
@@ -671,5 +793,96 @@ final class WifiEngine {
             ssidCurrent: currentSSID,
             lastJoinResult: "none"
         )
+    }
+}
+
+// MARK: - Failback
+//
+// The hotspot and every real network share one radio, so returning to Wi-Fi
+// is an action, not a preference: something has to actively leave the
+// hotspot. And while we are on the hotspot we cannot measure whether campus
+// Wi-Fi recovered without giving up the connection we have. So the sequence
+// is deliberately conservative: prove a saved network is in range and strong
+// enough FIRST, only then drop the hotspot, and treat "landed back on the
+// hotspot" as a failure rather than a success.
+//
+// Nothing here reads, stores, or transmits a credential. Leaving the hotspot
+// hands the choice to macOS auto-join, which reuses the keychain profile —
+// including 802.1X enterprise ones like utexas — exactly as if you had
+// clicked the network yourself.
+
+extension WifiEngine {
+
+    /// Saved networks that are in range, strong enough, and not the hotspot.
+    ///
+    /// Matching against the whole saved-profile list rather than one
+    /// configured "home SSID" is what makes this survive campus networks that
+    /// split or rename themselves (MyResNet-2G / MyResNet-5G / "MyResNet 5G"
+    /// are three separate saved entries for one place).
+    func failbackCandidates(config: RuntimeConfig) -> [String] {
+        let saved = Set(savedProfileSSIDs()).subtracting([config.ssid])
+        guard !saved.isEmpty else { return [] }
+        guard let interface = CWWiFiClient.shared().interface() else { return [] }
+
+        let scanned: [CWNetwork]
+        do {
+            scanned = Array(try interface.scanForNetworks(withSSID: nil))
+        } catch {
+            wifiLog("warn", "failbackCandidates: scan failed: \(error.localizedDescription)")
+            return []
+        }
+
+        var seen = Set<String>()
+        var out: [String] = []
+        for net in scanned {
+            guard let ssid = net.ssid, saved.contains(ssid), !seen.contains(ssid) else { continue }
+            guard net.rssiValue >= config.failbackMinRSSI else {
+                wifiLog("info", "failbackCandidates: skipping \(ssid) at \(net.rssiValue) dBm (floor \(config.failbackMinRSSI))")
+                continue
+            }
+            seen.insert(ssid)
+            out.append(ssid)
+        }
+        return out
+    }
+
+    /// Leaves the hotspot and lets macOS auto-join, then verifies real
+    /// internet on whatever it picked.
+    ///
+    /// Returns true only when we end up associated to a NON-hotspot SSID with
+    /// a passing probe. Auto-join is free to pick the hotspot again (it is a
+    /// saved network in range like any other); that counts as a failure, and
+    /// the caller backs off. The engine self-corrects rather than trying to
+    /// out-guess macOS's ranking.
+    func attemptFailback(config: RuntimeConfig) -> Bool {
+        guard let interface = CWWiFiClient.shared().interface() else { return false }
+
+        let candidates = failbackCandidates(config: config)
+        guard !candidates.isEmpty else {
+            wifiLog("info", "failback: no saved non-hotspot network in range; staying on hotspot")
+            return false
+        }
+        wifiLog("info", "failback: candidates in range: \(candidates.joined(separator: ", "))")
+
+        interface.disassociate()
+
+        let deadline = Date().addingTimeInterval(Double(config.failbackSettle))
+        while Date() < deadline {
+            Thread.sleep(forTimeInterval: 1)
+            let now = interface.ssid() ?? ""
+            if now.isEmpty || now == config.ssid { continue }
+            let status = probeStatus(interface: config.interface)
+            if status == .online {
+                wifiLog("info", "failback: back on \(now) with verified internet")
+                return true
+            }
+            if status == .captivePortal {
+                wifiLog("warn", "failback: \(now) is up but behind a captive portal; sign in to use it")
+                return false
+            }
+        }
+
+        wifiLog("warn", "failback: gave up after \(config.failbackSettle)s (now on \(interface.ssid() ?? "nothing"))")
+        return false
     }
 }

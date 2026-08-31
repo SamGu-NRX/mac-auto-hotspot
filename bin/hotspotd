@@ -59,7 +59,7 @@ load_config() {
   # U+2019 RIGHT SINGLE QUOTATION MARK, encoded as the raw UTF-8 octal escape
   # so no editor/shell normalizes it to ASCII '. See the matching literal
   # (with this same comment) in libexec/auto-hotspot-check.sh.
-  SSID=$(printf 'Andrew\342\200\231s iPhone')
+  SSID=$(printf 'Sam Gu\342\200\231s iPhone')
   CHECK_INTERVAL=300
   ENABLED=1
   COOLDOWN=30

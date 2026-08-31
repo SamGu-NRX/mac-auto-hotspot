@@ -121,7 +121,13 @@ final class Watcher {
             forName: NSWorkspace.didWakeNotification, object: nil, queue: nil
         ) { [weak self] _ in
             guard let self = self else { return }
-            self.queue.async { self.scheduleDebounced(reason: "wake") }
+            self.queue.async {
+                // Waking somewhere new invalidates a backoff earned at the
+                // last location, so failback starts fresh rather than
+                // sitting out a 20-minute penalty from another building.
+                clearFailbackState()
+                self.scheduleDebounced(reason: "wake")
+            }
         }
     }
 
@@ -209,13 +215,27 @@ final class Watcher {
         let ssidNow = CWWiFiClient.shared().interface()?.ssid() ?? ""
         let locationAuthorized = WifiEngine.shared.isLocationAuthorized()
 
-        if probeOnline(interface: config.interface) {
-            wifiLog("info", "evaluate (\(reason)): online via \(ssidNow.isEmpty ? "other/none" : ssidNow)")
+        let probe = confirmProbe(config: config)
+
+        if probe == .online {
+            // Online *through the hotspot* is the case upstream never
+            // handled: the probe passes, so nothing ever moves back to Wi-Fi.
+            if config.failback && !config.ssid.isEmpty && ssidNow == config.ssid {
+                maybeFailback(config: config)
+            } else {
+                clearFailbackState()
+            }
+            let ssidAfter = CWWiFiClient.shared().interface()?.ssid() ?? ssidNow
+            wifiLog("info", "evaluate (\(reason)): online via \(ssidAfter.isEmpty ? "other/none" : ssidAfter)")
             clearLastJoinAttempt()
             offlineEpisodeNotified = false
             writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
-                              ssidCurrent: ssidNow, lastJoinResult: "online")
+                              ssidCurrent: ssidAfter, lastJoinResult: "online")
             return
+        }
+
+        if probe == .captivePortal {
+            wifiLog("warn", "evaluate (\(reason)): \(ssidNow.isEmpty ? "this network" : ssidNow) answers HTTP but is behind a captive portal — no internet, failing over; sign in to use it directly")
         }
 
         if let last = readLastJoinAttempt() {
@@ -278,6 +298,40 @@ final class Watcher {
                 offlineEpisodeNotified = true
                 postOfflineNotification(ssid: config.ssid, result: result, locationAuthorized: locationAuthorized)
             }
+        }
+    }
+
+    /// Runs only while online *on the hotspot*. Rate-limited by an
+    /// exponential backoff so a campus network that is up-but-unusable does
+    /// not cost a connectivity blip every few minutes.
+    ///
+    /// Must run on `queue`, under the same lock as the rest of the evaluation.
+    private func maybeFailback(config: RuntimeConfig) {
+        let wait = readFailbackBackoff() ?? config.failbackInterval
+        if let last = readFailbackAttempt() {
+            let elapsed = Date().timeIntervalSince1970 - last
+            if elapsed < Double(wait) {
+                wifiLog("info", "failback: next attempt in \(Int(Double(wait) - elapsed))s")
+                return
+            }
+        }
+
+        writeFailbackAttempt()
+
+        if WifiEngine.shared.attemptFailback(config: config) {
+            clearFailbackState()
+            return
+        }
+
+        // Failed: back off, then get the hotspot back immediately rather than
+        // waiting out another full strike cycle to rediscover we are offline.
+        let next = min(max(wait * 2, config.failbackInterval), config.failbackBackoffMax)
+        writeFailbackBackoff(next)
+        wifiLog("info", "failback: unsuccessful, next attempt in \(next)s; restoring hotspot")
+
+        let restore = WifiEngine.shared.join(ssid: config.ssid, forceRejoin: true)
+        if restore != .success && restore != .alreadyJoined {
+            wifiLog("error", "failback: could not restore hotspot (result=\(restore.rawValue))")
         }
     }
 }

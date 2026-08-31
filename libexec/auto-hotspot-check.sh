@@ -179,6 +179,16 @@ current_ssid() {
 FAILOVER_STRIKES="${FAILOVER_STRIKES:-3}"
 STRIKE_INTERVAL="${STRIKE_INTERVAL:-5}"
 
+# Validate before use. `while [ 1 -le 0 ]` runs zero probes and then reports
+# "offline confirmed", so a malformed or zero value turns this gate into a
+# hair trigger that fails over to cellular without testing anything at all —
+# strictly worse than the single probe it replaced.
+case "$FAILOVER_STRIKES" in ''|*[!0-9]*) FAILOVER_STRIKES=3 ;; esac
+[ "$FAILOVER_STRIKES" -lt 1 ] && FAILOVER_STRIKES=3
+[ "$FAILOVER_STRIKES" -gt 10 ] && FAILOVER_STRIKES=10
+case "$STRIKE_INTERVAL" in ''|*[!0-9]*) STRIKE_INTERVAL=5 ;; esac
+[ "$STRIKE_INTERVAL" -gt 60 ] && STRIKE_INTERVAL=60
+
 confirm_offline() {
     _i=1
     while [ "$_i" -le "$FAILOVER_STRIKES" ]; do

@@ -138,6 +138,18 @@ func loadRuntimeConfig() -> RuntimeConfig {
         }
     }
 
+    // Clamp after parsing, not per-key. Upper bounds exist because Swift traps
+    // on Int overflow: an absurd FAILBACK_INTERVAL made `wait * 2` crash the
+    // watcher immediately after it had disassociated. The backoff ceiling is
+    // raised to the floor rather than the reverse, so a ceiling below the
+    // configured interval can never make retries *more* frequent than asked.
+    config.failoverStrikes    = min(max(config.failoverStrikes, 1), 10)
+    config.strikeInterval     = min(max(config.strikeInterval, 0), 60)
+    config.failbackInterval   = min(max(config.failbackInterval, 30), 86_400)
+    config.failbackBackoffMax = min(max(config.failbackBackoffMax, config.failbackInterval), 86_400)
+    config.failbackSettle     = min(max(config.failbackSettle, 1), 120)
+    config.failbackMinRSSI    = min(max(config.failbackMinRSSI, -100), -10)
+
     return config
 }
 

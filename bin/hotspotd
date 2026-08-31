@@ -445,14 +445,20 @@ cmd_menubar() {
   # Capture then match, never `... | grep -q` — under `set -o pipefail` grep -q
   # SIGPIPEs the producer on match, the pipeline reports 141, and the test
   # inverts: the identity would be found yet we'd still sign ad-hoc.
+  # SIGN_IDENTITY lets an existing trusted identity (e.g. an Apple Development
+  # cert already in the keychain) be reused instead of requiring a hand-made
+  # one named "AutoHotspot Signing". Any stable identity works: it is the
+  # certificate, not the name, that keeps the designated requirement — and so
+  # the Location Services grant — constant across rebuilds.
+  _sign_identity="${SIGN_IDENTITY:-AutoHotspot Signing}"
   _identities="$(security find-identity -v -p codesigning 2>/dev/null)"
   case "$_identities" in
-    *"AutoHotspot Signing"*) _have_identity=1 ;;
+    *"$_sign_identity"*) _have_identity=1 ;;
     *) _have_identity=0 ;;
   esac
   if [ "$_have_identity" -eq 1 ]; then
     codesign --force --options runtime --identifier com.andrewwang.autohotspot.menubar \
-      --sign 'AutoHotspot Signing' "$ROOT/build/AutoHotspot.app"
+      --sign "$_sign_identity" "$ROOT/build/AutoHotspot.app"
     codesign_rc=$?
   else
     codesign --force --options runtime --identifier com.andrewwang.autohotspot.menubar \

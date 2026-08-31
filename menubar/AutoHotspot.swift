@@ -220,11 +220,25 @@ final class Watcher {
         if probe == .online {
             // Online *through the hotspot* is the case upstream never
             // handled: the probe passes, so nothing ever moves back to Wi-Fi.
+            var healthy = true
             if config.failback && !config.ssid.isEmpty && ssidNow == config.ssid {
-                maybeFailback(config: config)
+                healthy = maybeFailback(config: config)
             } else {
                 clearFailbackState()
             }
+
+            // Failback drops the hotspot on purpose. If it could neither reach
+            // Wi-Fi nor get the hotspot back, we are offline *now* — reporting
+            // the pre-failback probe as "online" would clear the retry stamp
+            // and hide a real outage until the next safety-net tick.
+            if !healthy {
+                wifiLog("error", "evaluate (\(reason)): failback left no working connection")
+                writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
+                                  ssidCurrent: CWWiFiClient.shared().interface()?.ssid() ?? "",
+                                  lastJoinResult: "failback_stranded")
+                return
+            }
+
             let ssidAfter = CWWiFiClient.shared().interface()?.ssid() ?? ssidNow
             wifiLog("info", "evaluate (\(reason)): online via \(ssidAfter.isEmpty ? "other/none" : ssidAfter)")
             clearLastJoinAttempt()
@@ -306,13 +320,17 @@ final class Watcher {
     /// not cost a connectivity blip every few minutes.
     ///
     /// Must run on `queue`, under the same lock as the rest of the evaluation.
-    private func maybeFailback(config: RuntimeConfig) {
+    /// Returns true while we still have a working connection (failback
+    /// succeeded, was skipped, or failed but the hotspot came back). Returns
+    /// false only when we are left with nothing.
+    @discardableResult
+    private func maybeFailback(config: RuntimeConfig) -> Bool {
         let wait = readFailbackBackoff() ?? config.failbackInterval
         if let last = readFailbackAttempt() {
             let elapsed = Date().timeIntervalSince1970 - last
             if elapsed < Double(wait) {
                 wifiLog("info", "failback: next attempt in \(Int(Double(wait) - elapsed))s")
-                return
+                return true
             }
         }
 
@@ -320,7 +338,7 @@ final class Watcher {
 
         if WifiEngine.shared.attemptFailback(config: config) {
             clearFailbackState()
-            return
+            return true
         }
 
         // Failed: back off, then get the hotspot back immediately rather than
@@ -332,7 +350,11 @@ final class Watcher {
         let restore = WifiEngine.shared.join(ssid: config.ssid, forceRejoin: true)
         if restore != .success && restore != .alreadyJoined {
             wifiLog("error", "failback: could not restore hotspot (result=\(restore.rawValue))")
+            return false
         }
+        // Association is not connectivity: confirm before claiming health.
+        Thread.sleep(forTimeInterval: 3)
+        return probeStatus(interface: config.interface) == .online
     }
 }
 

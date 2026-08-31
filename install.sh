@@ -402,7 +402,14 @@ if [ "$DRY_RUN" -eq 1 ]; then
 elif [ "${APP_BUILD_STATUS:-}" = "preserved" ]; then
   echo "App bundle: preserved (sources unchanged, signature unchanged) — no need to re-grant Location Services"
 else
-  echo "App bundle: rebuilt (new ad-hoc signature) — macOS may ask you to re-grant Location Services"
+  # Derive the message from the signature actually produced. Hardcoding
+  # "ad-hoc" told users to expect a revoked Location grant even when a real
+  # identity had kept it stable.
+  if codesign -dvvv "$APP_PATH" 2>&1 | grep -q "^Authority="; then
+    echo "App bundle: rebuilt and signed with a stable identity — the Location Services grant survives future rebuilds"
+  else
+    echo "App bundle: rebuilt (new ad-hoc signature) — macOS may ask you to re-grant Location Services"
+  fi
 fi
 cat <<EOF
 Next steps (open a new shell first, or run: hash -r)

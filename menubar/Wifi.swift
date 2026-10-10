@@ -3,98 +3,13 @@ import CoreLocation
 import CoreWLAN
 import UserNotifications
 
-// MARK: - Shared contract paths (see CLAUDE.md "shared contract")
-//
-// These mirror bin/hotspotd and libexec/auto-hotspot-check.sh. Every value
-// here has an env override so tests never touch the real install.
-
-enum WifiPaths {
-    static var logPath: String {
-        ProcessInfo.processInfo.environment["AUTO_HOTSPOT_LOG"]
-            ?? (NSHomeDirectory() + "/Library/Logs/auto-hotspot.log")
-    }
-
-    static var stateDir: String {
-        ProcessInfo.processInfo.environment["AUTO_HOTSPOT_STATE"]
-            ?? (NSHomeDirectory() + "/.local/state/auto-hotspot")
-    }
-
-    static var configPath: String {
-        ProcessInfo.processInfo.environment["AUTO_HOTSPOT_CONFIG"]
-            ?? (NSHomeDirectory() + "/.config/auto-hotspot/config")
-    }
-
-    static var agentStatusPath: String { stateDir + "/agent.status" }
-    static var triggerPath: String { stateDir + "/trigger" }
-    static var lockPath: String { stateDir + "/lock" }
-    static var lastJoinAttemptPath: String { stateDir + "/last-join-attempt" }
-}
-
-// MARK: - Runtime config
-//
-// Mirrors bin/hotspotd's load_config / libexec/auto-hotspot-check.sh's config
-// sourcing: same defaults, same keys. Reloaded from disk on every evaluation
-// (see Watcher.performEvaluation in AutoHotspot.swift) so editing the config
-// file takes effect without a reinstall or restart.
-
-struct RuntimeConfig {
-    var ssid: String
-    var checkInterval: Int
-    var enabled: Bool
-    var cooldown: Int
-    var interface: String
-    var hotspotRouter: String
-    var notify: Bool
-}
-
-private func unquoteConfigValue(_ raw: String) -> String {
-    var value = raw.trimmingCharacters(in: .whitespaces)
-    if value.count >= 2, let first = value.first, let last = value.last,
-       (first == "\"" && last == "\"") || (first == "'" && last == "'") {
-        value = String(value.dropFirst().dropLast())
-    }
-    return value
-}
-
-func loadRuntimeConfig() -> RuntimeConfig {
-    var config = RuntimeConfig(
-        ssid: "Andrew\u{2019}s iPhone",
-        checkInterval: 300,
-        enabled: true,
-        cooldown: 30,
-        interface: "en0",
-        hotspotRouter: "172.20.10.1",
-        notify: true
-    )
-
-    guard let contents = try? String(contentsOfFile: WifiPaths.configPath, encoding: .utf8) else {
-        return config
-    }
-
-    for rawLine in contents.split(separator: "\n", omittingEmptySubsequences: false) {
-        let line = String(rawLine)
-        if line.hasPrefix("SSID=") {
-            let v = unquoteConfigValue(String(line.dropFirst("SSID=".count)))
-            if !v.isEmpty { config.ssid = v }
-        } else if line.hasPrefix("CHECK_INTERVAL=") {
-            if let n = Int(unquoteConfigValue(String(line.dropFirst("CHECK_INTERVAL=".count)))) { config.checkInterval = n }
-        } else if line.hasPrefix("ENABLED=") {
-            config.enabled = unquoteConfigValue(String(line.dropFirst("ENABLED=".count))) == "1"
-        } else if line.hasPrefix("COOLDOWN=") {
-            if let n = Int(unquoteConfigValue(String(line.dropFirst("COOLDOWN=".count)))) { config.cooldown = n }
-        } else if line.hasPrefix("WIFI_INTERFACE=") {
-            let v = unquoteConfigValue(String(line.dropFirst("WIFI_INTERFACE=".count)))
-            if !v.isEmpty { config.interface = v }
-        } else if line.hasPrefix("HOTSPOT_ROUTER=") {
-            let v = unquoteConfigValue(String(line.dropFirst("HOTSPOT_ROUTER=".count)))
-            if !v.isEmpty { config.hotspotRouter = v }
-        } else if line.hasPrefix("NOTIFY=") {
-            config.notify = unquoteConfigValue(String(line.dropFirst("NOTIFY=".count))) == "1"
-        }
-    }
-
-    return config
-}
+// The shared contract paths, the runtime config parser, the agent.status
+// writer, the single-flight lock, the cooldown stamp, the shared log, the
+// join-result vocabulary, and the controller decision logic live in the
+// portable HotspotCore package (core/) and are compiled directly into this
+// target. This file keeps only the macOS glue — CoreWLAN, CoreLocation,
+// UserNotifications, and the curl/ipconfig probes — bound to HotspotCore
+// through SystemEffects (see below).
 
 // MARK: - Shelling out
 //
@@ -126,81 +41,23 @@ func runTool(_ path: String, _ args: [String]) -> (Int32, String) {
 // worthless — see libexec/auto-hotspot-check.sh), no SSID read required.
 // Bound to the Wi-Fi interface via curl --interface so the probe reflects
 // that interface's route, not whichever interface currently owns default.
+// These raw implementations are exposed to HotspotCore's Controller
+// through SystemEffects (probeOnline(interface:) /
+// currentRouter(interface:)); the verifyJoin decision itself lives in
+// HotspotCore.
 
-func probeOnline(interface: String) -> Bool {
+/// The raw reachability probe: curl bound to the given interface plus the
+/// captive-portal check.
+func probeOnlineWithCurl(interface: String) -> Bool {
     let (_, out) = runTool("/usr/bin/curl", ["-sS", "-m", "4", "--interface", interface,
                                               "http://captive.apple.com/hotspot-detect.html"])
     return out.contains("<TITLE>Success</TITLE>")
 }
 
-func currentRouter(interface: String) -> String {
+/// The raw DHCP router read (ipconfig getoption).
+func currentRouterViaIpconfig(interface: String) -> String {
     let (_, out) = runTool("/usr/sbin/ipconfig", ["getoption", interface, "router"])
     return out.trimmingCharacters(in: .whitespacesAndNewlines)
-}
-
-/// A join only counts once the DHCP router fingerprint matches the iOS
-/// tethering gateway AND the reachability probe succeeds — either alone can
-/// be a false positive (e.g. a stale lease, or a captive portal answering
-/// on a different interface).
-func verifyJoin(config: RuntimeConfig) -> Bool {
-    let router = currentRouter(interface: config.interface)
-    guard router == config.hotspotRouter else {
-        wifiLog("warn", "verifyJoin: router is \(router.isEmpty ? "(none)" : router), expected \(config.hotspotRouter)")
-        return false
-    }
-    return probeOnline(interface: config.interface)
-}
-
-// MARK: - Single-flight lock
-//
-// Same mkdir-style lock, same path, same 5-minute staleness window as
-// libexec/auto-hotspot-check.sh's acquire_lock — so the app and the
-// degraded-mode script can never race each other.
-
-private let lockStaleSeconds: TimeInterval = 300
-
-func acquireLock() -> Bool {
-    let fm = FileManager.default
-    do {
-        try fm.createDirectory(atPath: WifiPaths.lockPath, withIntermediateDirectories: false)
-        return true
-    } catch {
-        // Lock dir likely already exists; fall through to the staleness check.
-    }
-    if let attrs = try? fm.attributesOfItem(atPath: WifiPaths.lockPath),
-       let modified = attrs[.modificationDate] as? Date,
-       Date().timeIntervalSince(modified) > lockStaleSeconds {
-        try? fm.removeItem(atPath: WifiPaths.lockPath)
-        if (try? fm.createDirectory(atPath: WifiPaths.lockPath, withIntermediateDirectories: false)) != nil {
-            return true
-        }
-    }
-    return false
-}
-
-func releaseLock() {
-    try? FileManager.default.removeItem(atPath: WifiPaths.lockPath)
-}
-
-// MARK: - last-join-attempt stamp
-//
-// Same file, same format (epoch seconds, plain text) as the shell worker's
-// LAST_JOIN_FILE, so cooldown state is shared regardless of which one wrote it.
-
-func readLastJoinAttempt() -> TimeInterval? {
-    guard let s = try? String(contentsOfFile: WifiPaths.lastJoinAttemptPath, encoding: .utf8) else { return nil }
-    return TimeInterval(s.trimmingCharacters(in: .whitespacesAndNewlines))
-}
-
-func writeLastJoinAttempt() {
-    let fm = FileManager.default
-    try? fm.createDirectory(atPath: WifiPaths.stateDir, withIntermediateDirectories: true)
-    let ts = Int(Date().timeIntervalSince1970)
-    try? "\(ts)".write(toFile: WifiPaths.lastJoinAttemptPath, atomically: true, encoding: .utf8)
-}
-
-func clearLastJoinAttempt() {
-    try? FileManager.default.removeItem(atPath: WifiPaths.lastJoinAttemptPath)
 }
 
 // MARK: - Offline notification
@@ -265,47 +122,6 @@ func postOfflineNotification(ssid: String, result: JoinResult, locationAuthorize
     }
 }
 
-// MARK: - Filesystem helpers
-
-func ensureFileExists(atPath path: String) {
-    let fm = FileManager.default
-    try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
-                             withIntermediateDirectories: true)
-    if !fm.fileExists(atPath: path) {
-        fm.createFile(atPath: path, contents: nil)
-    }
-}
-
-// MARK: - Logging
-//
-// Same "[ts] [level] msg" format as libexec/auto-hotspot-check.sh's log(),
-// appended to the same file so `hotspotd` and the app interleave in one log.
-
-private let wifiLogFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "yyyy-MM-dd'T'HH:mm:ssZ"
-    f.locale = Locale(identifier: "en_US_POSIX")
-    return f
-}()
-
-func wifiLog(_ level: String, _ message: String) {
-    let ts = wifiLogFormatter.string(from: Date())
-    let line = "[\(ts)] [\(level)] \(message)\n"
-    let path = WifiPaths.logPath
-    let fm = FileManager.default
-    try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
-                             withIntermediateDirectories: true)
-    if !fm.fileExists(atPath: path) {
-        fm.createFile(atPath: path, contents: nil)
-    }
-    guard let data = line.data(using: .utf8) else { return }
-    if let handle = FileHandle(forWritingAtPath: path) {
-        defer { try? handle.close() }
-        handle.seekToEndOfFile()
-        handle.write(data)
-    }
-}
-
 // MARK: - Target SSID
 //
 // U+2019 RIGHT SINGLE QUOTATION MARK, encoded as a raw unicode scalar so no
@@ -331,64 +147,83 @@ func targetSSID() -> String {
     return fallback
 }
 
-// MARK: - Join result
-
-enum JoinResult: String {
-    case success
-    case alreadyJoined = "already_joined"
-    case notFound = "not_found"
-    case authFailed = "auth_failed"
-    case interfaceError = "interface_error"
-    case verificationFailed = "verification_failed"
-    case wifiOff = "wifi_off"
-}
-
-// MARK: - agent.status
+// MARK: - System effects
 //
-// Written atomically (temp file + rename) on every engine event so `hotspotd
-// status` can merge it in without ever seeing a half-written file.
+// The concrete ControllerEffects implementation: binds HotspotCore's
+// dependency-free Controller to the real facilities — CoreWLAN through
+// WifiEngine, the curl/ipconfig probes above, the shared state files
+// (StateStore), the shared log, and user notifications.
 
-struct AgentStatus: Codable {
-    var watcher_running: Bool
-    var location_authorized: Bool
-    var ssid_current: String
-    var last_join_result: String
-    var updated: Int
-}
+final class SystemEffects: ControllerEffects {
+    static let shared = SystemEffects()
+    private init() {}
 
-func writeAgentStatus(watcherRunning: Bool, locationAuthorized: Bool,
-                       ssidCurrent: String, lastJoinResult: String) {
-    let dir = WifiPaths.stateDir
-    let fm = FileManager.default
-    do {
-        try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
-    } catch {
-        wifiLog("error", "agent.status: could not create state dir: \(error.localizedDescription)")
-        return
+    func now() -> Double {
+        Date().timeIntervalSince1970
     }
 
-    let status = AgentStatus(
-        watcher_running: watcherRunning,
-        location_authorized: locationAuthorized,
-        ssid_current: ssidCurrent,
-        last_join_result: lastJoinResult,
-        updated: Int(Date().timeIntervalSince1970)
-    )
-
-    guard let data = try? JSONEncoder().encode(status) else {
-        wifiLog("error", "agent.status: encode failed")
-        return
+    func currentSSID() -> String {
+        CWWiFiClient.shared().interface()?.ssid() ?? ""
     }
 
-    let finalPath = WifiPaths.agentStatusPath
-    let tmpPath = finalPath + ".tmp.\(ProcessInfo.processInfo.processIdentifier)"
-    do {
-        try data.write(to: URL(fileURLWithPath: tmpPath))
-        _ = try fm.replaceItemAt(URL(fileURLWithPath: finalPath),
-                                  withItemAt: URL(fileURLWithPath: tmpPath))
-    } catch {
-        wifiLog("error", "agent.status: atomic write failed: \(error.localizedDescription)")
-        try? fm.removeItem(atPath: tmpPath)
+    func locationAuthorized() -> Bool {
+        WifiEngine.shared.isLocationAuthorized()
+    }
+
+    func probeOnline(interface: String) -> Bool {
+        probeOnlineWithCurl(interface: interface)
+    }
+
+    func currentRouter(interface: String) -> String {
+        currentRouterViaIpconfig(interface: interface)
+    }
+
+    func ensureWifiPowerOn() -> Bool {
+        WifiEngine.shared.ensureWifiPowerOn()
+    }
+
+    func join(ssid: String, forceRejoin: Bool) -> JoinResult {
+        WifiEngine.shared.join(ssid: ssid, forceRejoin: forceRejoin)
+    }
+
+    func settle(seconds: Double) {
+        Thread.sleep(forTimeInterval: seconds)
+    }
+
+    func acquireLock() -> Bool {
+        StateStore.acquireLock()
+    }
+
+    func releaseLock() {
+        StateStore.releaseLock()
+    }
+
+    func readLastJoinAttempt() -> TimeInterval? {
+        StateStore.readLastJoinAttempt()
+    }
+
+    func writeLastJoinAttempt(at time: TimeInterval) {
+        StateStore.writeLastJoinAttempt(at: time)
+    }
+
+    func clearLastJoinAttempt() {
+        StateStore.clearLastJoinAttempt()
+    }
+
+    func writeAgentStatus(watcherRunning: Bool, locationAuthorized: Bool,
+                          ssidCurrent: String, lastJoinResult: String) {
+        writeAgentStatusFile(watcherRunning: watcherRunning,
+                             locationAuthorized: locationAuthorized,
+                             ssidCurrent: ssidCurrent,
+                             lastJoinResult: lastJoinResult)
+    }
+
+    func log(_ level: String, _ message: String) {
+        wifiLog(level, message)
+    }
+
+    func notifyOffline(ssid: String, result: JoinResult, locationAuthorized: Bool) {
+        postOfflineNotification(ssid: ssid, result: result, locationAuthorized: locationAuthorized)
     }
 }
 
@@ -665,7 +500,7 @@ final class WifiEngine {
         let present = profiles.contains(target) ? "yes" : "no"
         wifiLog("info", "profiles: \(profiles.count) saved, target present=\(present)")
 
-        writeAgentStatus(
+        writeAgentStatusFile(
             watcherRunning: true,
             locationAuthorized: isLocationAuthorized(),
             ssidCurrent: currentSSID,

@@ -82,11 +82,7 @@ final class Watcher {
 
     private var lastEvalTime: Date = .distantPast
     private var debounceWorkItem: DispatchWorkItem?
-    private var offlineEpisodeNotified = false
-    // Set when a cycle sees .alreadyJoined but then fails verification — the
-    // next join() call forces a disassociate+rejoin instead of repeating the
-    // identical alreadyJoined->verify-fail loop forever.
-    private var forceRejoinNext = false
+    private let controller = Controller()
 
     private init() {}
 
@@ -188,98 +184,17 @@ final class Watcher {
         }
     }
 
-    /// Must run on `queue`. This is the whole contract from the plan:
-    /// disabled -> skip; online -> clear cooldown stamp; offline within
-    /// cooldown -> log and skip; otherwise stamp then attempt the join.
+    /// Must run on `queue`. The decision logic lives in HotspotCore's
+    /// Controller, with its effects bound to the real system through
+    /// SystemEffects; this stays a thin, timed entry point. The full
+    /// contract (disabled -> skip; lock busy -> skip; online -> clear the
+    /// cooldown stamp; offline within cooldown -> skip; otherwise stamp,
+    /// restore the radio, join, and verify) is Controller.evaluate.
     private func performEvaluation(reason: String) {
         lastEvalTime = Date()
-        let config = loadRuntimeConfig()
-
-        guard config.enabled else {
-            wifiLog("info", "evaluate (\(reason)): disabled, skipping")
-            return
-        }
-
-        guard acquireLock() else {
-            wifiLog("warn", "evaluate (\(reason)): another check is running, skipping")
-            return
-        }
-        defer { releaseLock() }
-
-        let ssidNow = CWWiFiClient.shared().interface()?.ssid() ?? ""
-        let locationAuthorized = WifiEngine.shared.isLocationAuthorized()
-
-        if probeOnline(interface: config.interface) {
-            wifiLog("info", "evaluate (\(reason)): online via \(ssidNow.isEmpty ? "other/none" : ssidNow)")
-            clearLastJoinAttempt()
-            offlineEpisodeNotified = false
-            writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
-                              ssidCurrent: ssidNow, lastJoinResult: "online")
-            return
-        }
-
-        if let last = readLastJoinAttempt() {
-            let elapsed = Date().timeIntervalSince1970 - last
-            if elapsed < Double(config.cooldown) {
-                let remaining = Int(Double(config.cooldown) - elapsed)
-                wifiLog("info", "evaluate (\(reason)): offline but in cooldown (\(remaining)s left), skipping")
-                return
-            }
-        }
-
-        // Stamp BEFORE attempting the join so a crash mid-attempt still throttles.
-        writeLastJoinAttempt()
-
-        // Restore Wi-Fi power before touching anything else: a radio left
-        // off (e.g. by sleep/wake) makes scanning and association fail in a
-        // way indistinguishable from "hotspot not found" unless this is
-        // checked first. Mirrors the shell fallback's power-cycle recovery.
-        guard WifiEngine.shared.ensureWifiPowerOn() else {
-            wifiLog("error", "evaluate (\(reason)): Wi-Fi is off and could not be turned back on")
-            writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
-                              ssidCurrent: ssidNow, lastJoinResult: JoinResult.wifiOff.rawValue)
-            if config.notify && !offlineEpisodeNotified {
-                offlineEpisodeNotified = true
-                postOfflineNotification(ssid: config.ssid, result: .wifiOff, locationAuthorized: locationAuthorized)
-            }
-            return
-        }
-
-        wifiLog("info", "evaluate (\(reason)): offline, attempting join to \(config.ssid)")
-        let result = WifiEngine.shared.join(ssid: config.ssid, forceRejoin: forceRejoinNext)
-        forceRejoinNext = false
-
-        var verified = false
-        if result == .success || result == .alreadyJoined {
-            // Give DHCP a moment to hand out a lease before checking the
-            // router fingerprint, matching the shell worker's settle time.
-            Thread.sleep(forTimeInterval: 3)
-            verified = verifyJoin(config: config)
-        }
-
-        if verified {
-            wifiLog("info", "evaluate (\(reason)): joined \u{201C}\(config.ssid)\u{201D} and verified online")
-            clearLastJoinAttempt()
-            offlineEpisodeNotified = false
-            writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
-                              ssidCurrent: config.ssid, lastJoinResult: "success")
-        } else {
-            if result == .alreadyJoined {
-                // Stale association: verifyJoin failed against an SSID we
-                // were already on. Force a real disassociate+rescan+rejoin
-                // next cycle instead of reporting the same alreadyJoined
-                // shortcut and looping forever.
-                forceRejoinNext = true
-            }
-            wifiLog("error", "evaluate (\(reason)): join failed or unverified (result=\(result.rawValue))")
-            writeAgentStatus(watcherRunning: true, locationAuthorized: locationAuthorized,
-                              ssidCurrent: ssidNow, lastJoinResult: result.rawValue)
-            if config.notify && !offlineEpisodeNotified {
-                offlineEpisodeNotified = true
-                postOfflineNotification(ssid: config.ssid, result: result, locationAuthorized: locationAuthorized)
-            }
-        }
+        controller.evaluate(reason: reason, effects: SystemEffects.shared)
     }
+
 }
 
 // MARK: - AppDelegate
